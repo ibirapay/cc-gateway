@@ -1,9 +1,11 @@
 import { request as httpsRequest } from 'https'
+import { readFileSync, writeFileSync } from 'fs'
+import { resolve } from 'path'
 import { log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
 
 const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
-const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+const DEFAULT_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const DEFAULT_SCOPES = [
   'user:inference',
   'user:profile',
@@ -12,6 +14,10 @@ const DEFAULT_SCOPES = [
   'user:file_upload',
 ]
 
+// Will be overridden by config if provided
+let clientId = DEFAULT_CLIENT_ID
+let scopes = DEFAULT_SCOPES
+
 type OAuthTokens = {
   accessToken: string
   refreshToken: string
@@ -19,17 +25,64 @@ type OAuthTokens = {
 }
 
 let cachedTokens: OAuthTokens | null = null
+// Path to config.yaml so refreshed tokens can be persisted back across restarts.
+let configFilePath: string | null = null
+// Exponential backoff state for retry attempts (30s → 60s → 120s → 300s max)
+let retryBackoffMs = 30_000
+
+/**
+ * Persist freshly-refreshed tokens back into config.yaml.
+ *
+ * The OAuth refresh token is rotating: each successful refresh invalidates the
+ * previous refresh token. Without writing the new one back, a process restart
+ * would re-read the stale (now-invalid) token from disk and crash-loop with
+ * `invalid_grant`. Line-anchored replace preserves the rest of the YAML
+ * (comments, formatting), matching scripts/update-oauth.sh.
+ */
+function persistTokens(tokens: OAuthTokens): void {
+  if (!configFilePath) return
+  try {
+    const before = readFileSync(configFilePath, 'utf-8')
+    const after = before
+      .replace(/^(\s*access_token:).*$/m, (_m, p1) => `${p1} ${tokens.accessToken}`)
+      .replace(/^(\s*refresh_token:).*$/m, (_m, p1) => `${p1} ${tokens.refreshToken}`)
+      .replace(/^(\s*expires_at:).*$/m, (_m, p1) => `${p1} ${tokens.expiresAt}`)
+    if (after === before) {
+      log('warn', 'persistTokens: no oauth fields matched in config.yaml; not persisted')
+      return
+    }
+    writeFileSync(configFilePath, after)
+    log('info', 'Persisted refreshed OAuth token to config.yaml')
+  } catch (err) {
+    log('error', `persistTokens failed: ${err}`)
+  }
+}
 
 /**
  * Initialize OAuth.
  * If a valid access_token is provided, use it immediately — no network call.
  * Only refresh when the token is expired or about to expire.
+ * @param oauth - OAuth configuration with refresh_token and optional access_token/expires_at
+ * @param configPath - Path to config.yaml for persisting refreshed tokens
+ * @param customClientId - Optional override for OAuth client ID
+ * @param customScopes - Optional override for OAuth scopes
  */
-export async function initOAuth(oauth: {
-  access_token?: string
-  refresh_token: string
-  expires_at?: number
-}): Promise<void> {
+export async function initOAuth(
+  oauth: {
+    access_token?: string
+    refresh_token: string
+    expires_at?: number
+    client_id?: string
+    scopes?: string[]
+  },
+  configPath?: string,
+  customClientId?: string,
+  customScopes?: string[],
+): Promise<void> {
+  configFilePath = configPath || resolve(process.cwd(), 'config.yaml')
+  // Allow config-provided or parameter-provided client ID/scopes to override defaults
+  if (customClientId || oauth.client_id) clientId = customClientId || oauth.client_id || DEFAULT_CLIENT_ID
+  if (customScopes || oauth.scopes) scopes = customScopes || oauth.scopes || DEFAULT_SCOPES
   const now = Date.now()
   const expiresAt = oauth.expires_at ?? 0
   const fiveMinutes = 5 * 60 * 1000
@@ -55,6 +108,7 @@ export async function initOAuth(oauth: {
   }
 
   cachedTokens = await refreshOAuthToken(oauth.refresh_token)
+  persistTokens(cachedTokens)
   log('info', `OAuth token acquired, expires at ${new Date(cachedTokens.expiresAt).toISOString()}`)
   scheduleRefresh(oauth.refresh_token)
 }
@@ -71,11 +125,16 @@ function scheduleRefresh(refreshToken: string) {
       cachedTokens = await refreshOAuthToken(
         cachedTokens?.refreshToken || refreshToken,
       )
+      persistTokens(cachedTokens)
       log('info', `OAuth token refreshed, expires at ${new Date(cachedTokens.expiresAt).toISOString()}`)
+      retryBackoffMs = 30_000 // Reset backoff on success
       scheduleRefresh(cachedTokens.refreshToken || refreshToken)
     } catch (err) {
-      log('error', `OAuth refresh failed: ${err}. Retrying in 30s...`)
-      setTimeout(() => scheduleRefresh(refreshToken), 30_000)
+      // Exponential backoff: 30s → 60s → 120s → 300s max
+      const nextBackoff = Math.min(retryBackoffMs * 2, 300_000)
+      log('error', `OAuth refresh failed: ${err}. Retrying in ${nextBackoff / 1000}s...`)
+      setTimeout(() => scheduleRefresh(refreshToken), nextBackoff)
+      retryBackoffMs = nextBackoff
     }
   }, refreshIn)
 }
@@ -94,8 +153,8 @@ function refreshOAuthToken(refreshToken: string): Promise<OAuthTokens> {
     const body = JSON.stringify({
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-      scope: DEFAULT_SCOPES.join(' '),
+      client_id: clientId,
+      scope: scopes.join(' '),
     })
 
     const url = new URL(TOKEN_URL)

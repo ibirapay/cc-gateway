@@ -5,3 +5,11 @@ dist/
 config.yaml
 certs/
 clients/
+config.yaml.bak.*
+config.yaml.predeploy.*
+*.bak.*
+*.disabled.*
+dist.bak.*/
+active-proxy.txt
+usage-*-state.json
+cc-health.conf
