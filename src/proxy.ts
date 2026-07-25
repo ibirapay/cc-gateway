@@ -3,13 +3,16 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { readFileSync } from 'fs'
 import { request as httpsRequest } from 'https'
 import { URL } from 'url'
+import { randomUUID } from 'crypto'
 import type { Config } from './config.js'
 import { authenticate, initAuth } from './auth.js'
 import { getAccessToken } from './oauth.js'
 import { audit, log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
 import { maybeNotifyUsage } from './usage-notify.js'
-import { attachUsage, recordRequest } from './usage-meter.js'
+import { attachUsage, recordRequest, recordMetrics } from './usage-meter.js'
+import { initRateLimiter, checkRateLimit, logRateLimitHit } from './rate-limiter.js'
+import { isOpen, recordSuccess, recordFailure } from './circuit-breaker.js'
 
 // Headers that must NOT be forwarded upstream: hop-by-hop framing headers and
 // the client's own auth (the gateway injects the real OAuth token below).
@@ -46,6 +49,13 @@ function sanitizeHeaders(
 
 export function startProxy(config: Config) {
   initAuth(config)
+
+  // Initialize rate limiter with per-client limits
+  const rateLimits = new Map<string, number>()
+  for (const token of config.auth.tokens) {
+    rateLimits.set(token.name, token.rate_limit_rps ?? 0)
+  }
+  initRateLimiter(rateLimits)
 
   const upstream = new URL(config.upstream.url)
   const useTls = config.server.tls?.cert && config.server.tls?.key
@@ -107,8 +117,10 @@ async function handleRequest(
   const method = req.method || 'GET'
   const path = req.url || '/'
   const clientIp = req.socket.remoteAddress || 'unknown'
+  const requestId = randomUUID()
+  const startTime = Date.now()
 
-  log('info', `← ${method} ${path} from ${clientIp}`)
+  log('info', `[${requestId}] ← ${method} ${path} from ${clientIp}`)
 
   // Health check - no auth required
   if (path === '/_health') {
@@ -148,7 +160,22 @@ async function handleRequest(
     return
   }
 
-  log('info', `Client "${clientName}" → ${method} ${path}`)
+  log('info', `[${requestId}] Client "${clientName}" → ${method} ${path}`)
+
+  // Check rate limit
+  if (!checkRateLimit(clientName)) {
+    logRateLimitHit(clientName)
+    res.writeHead(429, { 'Content-Type': 'application/json', 'x-request-id': requestId })
+    res.end(JSON.stringify({ error: 'Rate limit exceeded', clientName }))
+    return
+  }
+
+  // Check circuit breaker
+  if (isOpen()) {
+    res.writeHead(503, { 'Content-Type': 'application/json', 'x-request-id': requestId })
+    res.end(JSON.stringify({ error: 'Gateway circuit breaker is open - upstream service unavailable' }))
+    return
+  }
 
   // Get the real OAuth token (managed by gateway)
   const oauthToken = getAccessToken()
@@ -165,6 +192,7 @@ async function handleRequest(
     chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
   }
   const body = Buffer.concat(chunks)
+  const requestBytes = body.length
 
   // OAuth-swap passthrough: forward the body unchanged (no identity/env masking).
   // Only strip hop-by-hop + client-auth headers; everything else passes through.
@@ -179,6 +207,9 @@ async function handleRequest(
   } else {
     forwardHeaders["x-api-key"] = oauthToken
   }
+
+  // Add request ID for tracing
+  forwardHeaders["x-request-id"] = requestId
 
   // Forward to upstream
   const upstreamUrl = new URL(path, upstream)
@@ -203,13 +234,39 @@ async function handleRequest(
 
       res.writeHead(status, responseHeaders)
 
+      // Track response size as it streams from upstream
+      let responseBytes = 0
+      const trackingRes = proxyRes.on('data', (chunk) => {
+        if (typeof chunk === 'string') {
+          responseBytes += Buffer.byteLength(chunk)
+        } else {
+          responseBytes += chunk.length
+        }
+      })
+
       // Stream response directly (SSE for Claude responses)
       proxyRes.pipe(res)
 
       // Attribute this response's token usage to the client (non-destructive
       // tap — must be attached right after pipe() so no chunks are missed).
-      attachUsage(clientName, proxyRes)
+      attachUsage(clientName, proxyRes, status)
       recordRequest(clientName, status)
+
+      // Record metrics (latency and sizes) when response ends
+      res.on('finish', () => {
+        const latencyMs = Date.now() - startTime
+        recordMetrics(clientName, latencyMs, requestBytes, responseBytes)
+      })
+
+      // Record circuit breaker state based on response
+      if (status >= 500) {
+        recordFailure(`upstream returned ${status}`)
+      } else if (status >= 400 && status < 500) {
+        // Client errors (4xx) don't trip circuit breaker
+        recordSuccess()
+      } else {
+        recordSuccess()
+      }
 
       // Watch the shared account's usage headers and ping Discord on 5% bands.
       maybeNotifyUsage(proxyRes.headers)
@@ -221,12 +278,13 @@ async function handleRequest(
   )
 
   proxyReq.on('error', (err) => {
-    log('error', `Upstream error: ${err.message}`)
+    log('error', `[${requestId}] Upstream error: ${err.message}`)
     if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'application/json' })
+      res.writeHead(502, { 'Content-Type': 'application/json', 'x-request-id': requestId })
       res.end(JSON.stringify({ error: 'Bad gateway', detail: err.message }))
     }
     recordRequest(clientName, 502)
+    recordFailure(`connection error: ${err.message}`)
     if (config.logging.audit) {
       audit(clientName, method, path, 502)
     }

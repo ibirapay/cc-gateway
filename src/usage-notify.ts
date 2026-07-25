@@ -24,8 +24,8 @@ const H_5H_UTIL = 'anthropic-ratelimit-unified-5h-utilization'
 
 let webhookUrl: string | null = null
 let statePath: string | null = null
-// Highest band we've already notified for (negative = nothing yet).
-let lastBand = -BAND_STEP
+// Highest band we've already notified for. Initialize to 0 to avoid spurious notifications for 0% utilization.
+let lastBand = 0
 
 type State = { band: number; util: number; ts: string }
 
@@ -49,6 +49,12 @@ function saveState(util: number): void {
   }
 }
 
+/**
+ * Initialize the Discord usage notifier.
+ * @param webhook - Discord webhook URL (optional; disables notifier if not provided)
+ * @param path - Path to persist notification state (default: usage-notify-state.json)
+ * @throws Error if webhook is provided but is not a valid Discord webhook URL
+ */
 export function initUsageNotify(webhook?: string, path?: string): void {
   webhookUrl = webhook || null
   statePath = path || resolve(process.cwd(), 'usage-notify-state.json')
@@ -56,6 +62,20 @@ export function initUsageNotify(webhook?: string, path?: string): void {
     log('info', 'Usage notifier disabled (no notify.discord_webhook in config)')
     return
   }
+
+  // Validate Discord webhook URL format
+  try {
+    const url = new URL(webhookUrl)
+    if (!url.hostname.includes('discord')) {
+      throw new Error('hostname is not discord.com')
+    }
+    if (!url.pathname.includes('/webhooks/')) {
+      throw new Error('URL path does not contain /webhooks/')
+    }
+  } catch (err) {
+    throw new Error(`Invalid Discord webhook URL: ${err instanceof Error ? err.message : err}`)
+  }
+
   loadState()
   log('info', `Usage notifier armed (last notified band: ${lastBand >= 0 ? lastBand + '%' : 'none'})`)
 }

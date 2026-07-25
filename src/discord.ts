@@ -2,9 +2,13 @@ import { request as httpsRequest } from 'https'
 import { log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
 
-// Shared Discord webhook sender. Routes through the gateway's egress proxy,
-// caps content at Discord's 2000-char limit, and never throws — a webhook
-// failure must never affect a client request.
+/**
+ * Send a message to a Discord webhook. Routes through the gateway's egress proxy.
+ * Never throws — webhook failures are logged but never affect client requests.
+ * @param webhook - Discord webhook URL
+ * @param content - Message content (capped at 2000 chars per Discord limit)
+ * @returns Promise that resolves when webhook delivery is complete (success or failure)
+ */
 export function sendDiscord(webhook: string, content: string): Promise<void> {
   return new Promise((done) => {
     let url: URL
