@@ -13,12 +13,18 @@ let rpsLimits = new Map<string, number>() // client -> max requests per second
 const WINDOW_SIZE_MS = 1000 // 1 second window
 
 /**
- * Initialize rate limiting with per-client limits (requests per second).
- * @param limits - Map of client name to max requests per second (0 = unlimited)
+ * Initialize rate limiting with global limit applied to all clients equally.
+ * All clients share the same limit since they pay equally for the shared account.
+ * @param limits - Map of client name to max requests per second (all should be same value)
  */
 export function initRateLimiter(limits: Map<string, number>): void {
   rpsLimits = limits
-  log('info', `Rate limiter initialized with ${limits.size} client limits`)
+  const limit = limits.size > 0 ? Array.from(limits.values())[0] : 0
+  if (limit > 0) {
+    log('info', `Rate limiter initialized: ${limit} req/sec per client (global limit for ${limits.size} clients)`)
+  } else {
+    log('info', `Rate limiter initialized: unlimited (no rate limit configured)`)
+  }
 }
 
 /**

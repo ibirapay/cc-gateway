@@ -50,12 +50,17 @@ function sanitizeHeaders(
 export function startProxy(config: Config) {
   initAuth(config)
 
-  // Initialize rate limiter with per-client limits
+  // Initialize rate limiter with global limit applied to all clients equally
+  // All clients share the same limit since they pay equally for the shared account
+  const globalLimit = config.rate_limiting?.rps ?? 0 // 0 = unlimited
   const rateLimits = new Map<string, number>()
   for (const token of config.auth.tokens) {
-    rateLimits.set(token.name, token.rate_limit_rps ?? 0)
+    rateLimits.set(token.name, globalLimit)
   }
   initRateLimiter(rateLimits)
+  if (globalLimit > 0) {
+    log('info', `Global rate limit: ${globalLimit} req/sec per client (shared account)`)
+  }
 
   const upstream = new URL(config.upstream.url)
   const useTls = config.server.tls?.cert && config.server.tls?.key

@@ -5,8 +5,6 @@ import { resolve } from 'path'
 export type TokenEntry = {
   name: string
   token: string
-  // Optional: max requests per second (0 or omitted = unlimited)
-  rate_limit_rps?: number
 }
 
 export type Config = {
@@ -56,6 +54,11 @@ export type Config = {
   logging: {
     level: 'debug' | 'info' | 'warn' | 'error'
     audit: boolean
+  }
+  // Rate limiting: global limit (requests per second) applied equally to all clients
+  // All clients share the same limit since they pay equally for the shared account
+  rate_limiting?: {
+    rps?: number  // Requests per second (0 or omitted = unlimited)
   }
   // Optional: Discord webhook to ping when shared-account usage crosses a band,
   // plus the interval for the scheduled per-user usage report.
