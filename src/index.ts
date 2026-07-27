@@ -5,6 +5,7 @@ import { startProxy } from './proxy.js'
 import { reloadProxyAgent } from './proxy-agent.js'
 import { initUsageNotify } from './usage-notify.js'
 import { initUsageMeter, postReport } from './usage-meter.js'
+import { initConversationLog } from './conversation-log.js'
 
 const configPath = process.argv[2]
 
@@ -53,6 +54,14 @@ try {
     log('info', 'SIGUSR1 received — posting per-user usage report')
     void postReport()
   })
+
+  // Conversation history log for regulatory retention (no-op if history.enabled is false/unset).
+  if (config.history?.enabled !== false) {
+    initConversationLog({
+      dir: config.history?.dir,
+      retentionDays: config.history?.retention_days,
+    })
+  }
 
   startProxy(config)
 } catch (err) {

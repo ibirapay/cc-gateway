@@ -119,7 +119,7 @@ function scheduleRefresh(refreshToken: string) {
   const msUntilExpiry = cachedTokens.expiresAt - Date.now()
   const refreshIn = Math.max(msUntilExpiry - 5 * 60 * 1000, 10_000)
 
-  setTimeout(async () => {
+  refreshTimer = setTimeout(async () => {
     try {
       log('info', 'Auto-refreshing OAuth token...')
       cachedTokens = await refreshOAuthToken(
@@ -146,6 +146,26 @@ export function getAccessToken(): string | null {
     return null
   }
   return cachedTokens.accessToken
+}
+
+let refreshTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Swap the live OAuth credentials with a new refresh token.
+ * Performs a test refresh first — only commits if the new token actually works.
+ * Returns the new access token expiry on success, throws on failure.
+ */
+export async function swapOAuth(newRefreshToken: string): Promise<{ expiresAt: number }> {
+  log('info', 'OAuth swap: testing new refresh token...')
+  const tokens = await refreshOAuthToken(newRefreshToken)
+  cachedTokens = tokens
+  persistTokens(tokens)
+  // Cancel the old refresh schedule and start a new one
+  if (refreshTimer) clearTimeout(refreshTimer)
+  scheduleRefresh(tokens.refreshToken)
+  retryBackoffMs = 30_000
+  log('info', `OAuth swap: success, new token expires at ${new Date(tokens.expiresAt).toISOString()}`)
+  return { expiresAt: tokens.expiresAt }
 }
 
 function refreshOAuthToken(refreshToken: string): Promise<OAuthTokens> {

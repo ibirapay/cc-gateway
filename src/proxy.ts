@@ -6,11 +6,12 @@ import { URL } from 'url'
 import { randomUUID } from 'crypto'
 import type { Config } from './config.js'
 import { authenticate, initAuth } from './auth.js'
-import { getAccessToken } from './oauth.js'
+import { getAccessToken, swapOAuth } from './oauth.js'
 import { audit, log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
 import { maybeNotifyUsage } from './usage-notify.js'
 import { attachUsage, recordRequest, recordMetrics } from './usage-meter.js'
+import { logRequestStart, logResponseAttach, logRequestError } from './conversation-log.js'
 import { initRateLimiter, checkRateLimit, logRateLimitHit } from './rate-limiter.js'
 import { isOpen, recordSuccess, recordFailure } from './circuit-breaker.js'
 
@@ -29,6 +30,8 @@ const STRIP_HEADERS = new Set([
   'content-length',
   'authorization',
   'x-api-key',
+  // Prevent compressed responses so attachUsage can parse SSE for token metering
+  'accept-encoding',
 ])
 
 /**
@@ -167,6 +170,52 @@ async function handleRequest(
 
   log('info', `[${requestId}] Client "${clientName}" → ${method} ${path}`)
 
+  // OAuth swap endpoint — authenticated client can replace the refresh token
+  if (path === '/_oauth' && method === 'POST') {
+    const chunks: Buffer[] = []
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+    }
+    try {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      const refreshToken = body?.refresh_token
+      if (!refreshToken || typeof refreshToken !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Missing refresh_token in request body' }))
+        return
+      }
+      if (!refreshToken.startsWith('sk-ant-ort01-')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: 'Invalid refresh token format (expected sk-ant-ort01-...)' }))
+        return
+      }
+      log('info', `[${requestId}] Client "${clientName}" requesting OAuth swap`)
+      const result = await swapOAuth(refreshToken)
+      if (config.logging.audit) {
+        audit(clientName, method, path, 200)
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        status: 'ok',
+        message: 'OAuth token swapped successfully',
+        expires_at: result.expiresAt,
+        expires_in_minutes: Math.round((result.expiresAt - Date.now()) / 60_000),
+      }))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      log('error', `[${requestId}] OAuth swap failed: ${msg}`)
+      if (config.logging.audit) {
+        audit(clientName, method, path, 502)
+      }
+      res.writeHead(502, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        error: 'OAuth swap failed — the new refresh token could not be exchanged',
+        detail: msg,
+      }))
+    }
+    return
+  }
+
   // Check rate limit
   if (!checkRateLimit(clientName)) {
     logRateLimitHit(clientName)
@@ -198,6 +247,8 @@ async function handleRequest(
   }
   const body = Buffer.concat(chunks)
   const requestBytes = body.length
+
+  logRequestStart(requestId, clientName, method, path, body, startTime)
 
   // OAuth-swap passthrough: forward the body unchanged (no identity/env masking).
   // Only strip hop-by-hop + client-auth headers; everything else passes through.
@@ -255,6 +306,7 @@ async function handleRequest(
       // Attribute this response's token usage to the client (non-destructive
       // tap — must be attached right after pipe() so no chunks are missed).
       attachUsage(clientName, proxyRes, status)
+      logResponseAttach(requestId, proxyRes, status)
       recordRequest(clientName, status)
 
       // Record metrics (latency and sizes) when response ends
@@ -284,6 +336,7 @@ async function handleRequest(
 
   proxyReq.on('error', (err) => {
     log('error', `[${requestId}] Upstream error: ${err.message}`)
+    logRequestError(requestId)
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'application/json', 'x-request-id': requestId })
       res.end(JSON.stringify({ error: 'Bad gateway', detail: err.message }))

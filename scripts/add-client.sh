@@ -136,6 +136,45 @@ case "$1" in
     exec command claude "$@"
     ;;
 
+  swap-oauth)
+    # Extract refresh token from local Claude credentials or accept as argument
+    if [[ -n "${2:-}" ]]; then
+      NEW_TOKEN="$2"
+    else
+      CRED_FILE="$HOME/.claude/.credentials.json"
+      if [[ ! -f "$CRED_FILE" ]]; then
+        echo "No credentials file at $CRED_FILE"
+        echo "Usage: $(basename "$0") swap-oauth [refresh-token]"
+        echo ""
+        echo "Either pass the token directly, or log into Claude Code first:"
+        echo "  claude --login"
+        exit 1
+      fi
+      NEW_TOKEN=$(python3 -c "import json; print(json.load(open('$CRED_FILE'))['claudeAiOauth']['refreshToken'])" 2>/dev/null)
+      if [[ -z "$NEW_TOKEN" || "$NEW_TOKEN" == "$CLIENT_TOKEN" ]]; then
+        echo "Could not extract a valid refresh token from $CRED_FILE"
+        echo "Log into Claude Code first: claude --login"
+        exit 1
+      fi
+      echo "Extracted refresh token from $CRED_FILE"
+    fi
+    echo "Sending to gateway..."
+    RESP=$(curl -sk --max-time 30 \
+      -X POST "${GATEWAY_URL}/_oauth" \
+      -H "x-api-key: ${CLIENT_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"refresh_token\": \"${NEW_TOKEN}\"}" 2>/dev/null)
+    if echo "$RESP" | grep -q '"ok"'; then
+      echo "OAuth swapped successfully."
+      echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+    else
+      echo "OAuth swap failed:"
+      echo "$RESP" | python3 -m json.tool 2>/dev/null || echo "$RESP"
+      exit 1
+    fi
+    exit 0
+    ;;
+
   status)
     echo "Gateway:  $GATEWAY_URL"
     if grep -q "$ALIAS_TAG" "$RC_FILE" 2>/dev/null; then
@@ -168,6 +207,10 @@ case "$1" in
     echo "  ccg hijack             Make 'claude' go through gateway"
     echo "  ccg release            Restore 'claude' to native"
     echo "  ccg native [args]      Run native claude once (bypass gateway)"
+    echo ""
+    echo "OAuth:"
+    echo "  ccg swap-oauth         Replace gateway OAuth (extracts from local login)"
+    echo "  ccg swap-oauth TOKEN   Replace gateway OAuth with specific token"
     echo ""
     echo "Info:"
     echo "  ccg status             Show gateway and hijack status"

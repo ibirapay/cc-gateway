@@ -66,6 +66,13 @@ export type Config = {
     discord_webhook?: string
     usage_report_interval_hours?: number
   }
+  // Conversation history logging for regulatory retention.
+  // Stores full request/response bodies as gzipped JSONL per day.
+  history?: {
+    enabled?: boolean
+    dir?: string              // default: ./conversation-history
+    retention_days?: number   // default: 365
+  }
 }
 
 function validateConfig(config: Config): void {

@@ -299,8 +299,9 @@ export function summaryText(): string {
     return cachedSummary
   }
 
+  const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
   const rows = [...clients.entries()].sort(
-    (a, b) => b[1].inputTokens + b[1].outputTokens - (a[1].inputTokens + a[1].outputTokens),
+    (a, b) => allIn(b[1]) + b[1].outputTokens - (allIn(a[1]) + a[1].outputTokens),
   )
   const sinceStr = since.slice(0, 16).replace('T', ' ') + ' UTC'
   if (!rows.length) {
@@ -316,17 +317,18 @@ export function summaryText(): string {
   let tErr4xx = 0
   let tErr5xx = 0
   const lines = rows.map(([name, c]) => {
+    const inTok = allIn(c)
     tReq += c.requests
-    tIn += c.inputTokens
+    tIn += inTok
     tOut += c.outputTokens
     tErr += c.errors
     tErr4xx += c.errors4xx
     tErr5xx += c.errors5xx
-    const tot = c.inputTokens + c.outputTokens
+    const tot = inTok + c.outputTokens
     const errStr = c.errors ? ` (${c.errors4xx}×4xx ${c.errors5xx}×5xx)` : ''
     const avgLatency = c.requests > 0 ? (c.totalLatencyMs / c.requests).toFixed(0) : 0
     const sizeStr = ` [req ${fmt(c.totalRequestBytes)} / res ${fmt(c.totalResponseBytes)}]`
-    return `• **${name}** — ${c.requests} req${errStr}, ${fmt(tot)} tok, avg ${avgLatency}ms${sizeStr}`
+    return `• **${name}** — ${c.requests} req${errStr}, ${fmt(tot)} tok (in ${fmt(inTok)} / out ${fmt(c.outputTokens)}), avg ${avgLatency}ms${sizeStr}`
   })
   const avgLatency = tReq > 0 ? (rows.reduce((sum, [_, c]) => sum + c.totalLatencyMs, 0) / tReq).toFixed(0) : 0
   const summary = [
