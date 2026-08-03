@@ -332,7 +332,7 @@ export function summaryText(): string {
   }
   if (!rows.length) {
     return cache(
-      `👑 **CC Gateway — Token Throne**\nThrone empty: not one token burned since ${sinceStr}. Suspicious.`,
+      `👑 **CC Gateway — Trono dos Tokens**\nTrono vazio: nenhum token queimado desde ${sinceStr}. Suspeito.`,
     )
   }
 
@@ -365,10 +365,10 @@ export function summaryText(): string {
   const [crasher, crasherC] = best((c) => c.errors)
   const [slow, slowC] = best((c) => (c.requests ? c.totalLatencyMs / c.requests : 0))
   const awards = [
-    `🗣️ **Motormouth**: ${chatty} (${fmt(chattyC.outputTokens)} out)`,
-    crasherC.errors ? `💥 **Crash-test dummy**: ${crasher} (${crasherC.errors})` : null,
+    `🗣️ **Tagarela**: ${chatty} (${fmt(chattyC.outputTokens)} de saída)`,
+    crasherC.errors ? `💥 **Quebra-tudo**: ${crasher} (${crasherC.errors} erros)` : null,
     slowC.requests
-      ? `🐢 **Slowpoke**: ${slow} (${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s avg)`
+      ? `🐢 **Lesma**: ${slow} (${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média)`
       : null,
   ]
     .filter(Boolean)
@@ -376,14 +376,17 @@ export function summaryText(): string {
 
   return cache(
     [
-      `👑 **CC Gateway — Token Throne** · since ${sinceStr}`,
+      `👑 **CC Gateway — Trono dos Tokens** · desde ${sinceStr}`,
       '```',
       ...board,
       '```',
-      `🏦 **${fmt(grand)} tok** across ${tReq} req` +
+      `🏦 **${fmt(grand)} tokens** em ${tReq} reqs` +
         (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
-        ` · avg ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s`,
+        ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
       awards,
+      // Legenda em subtexto (`-#` = texto pequeno no Discord).
+      '-# 📖 barra = consumo em relação ao líder · tokens = entrada + cache + saída · % = fatia do total · 💥 = requisições com erro',
+      '-# 🗣️ Tagarela = mais tokens gerados · 💥 Quebra-tudo = mais erros · 🐢 Lesma = maior latência média · placar zera a cada janela de 7 dias',
     ].join('\n'),
   )
 }

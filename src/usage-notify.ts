@@ -116,8 +116,9 @@ export function maybeNotifyUsage(
       void sendDiscord(
         webhookUrl,
         [
-          `🔄 **CC Gateway usage reset** — 7-day window rolled over. Fresh scoreboard, everyone back to zero.`,
+          `🔄 **Uso do CC Gateway zerado** — a janela de 7 dias virou. Placar novo, todo mundo volta pro zero.`,
           `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
+          '-# 📖 a janela de 7 dias é da conta compartilhada; o Trono dos Tokens recomeça junto',
         ].join('\n'),
       )
     }
@@ -139,12 +140,13 @@ export function maybeNotifyUsage(
   const emoji = band >= 90 ? '🚨' : band >= 75 ? '⚠️' : '📊'
 
   const lines = [
-    `${emoji} **CC Gateway usage crossed ${band}%**`,
+    `${emoji} **Uso do CC Gateway passou de ${band}%**`,
     `\`7d ${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%** (\`${status}\`)`,
     fiveH !== undefined
       ? `\`5h ${bar(Number(fiveH), 20)}\` ${(Number(fiveH) * 100).toFixed(1)}%`
       : null,
-    `7-day resets: ${resetStr}`,
+    `⏳ janela de 7 dias reinicia em ${resetStr}`,
+    '-# 📖 7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · quem gastou o quê sai no 👑 Trono dos Tokens',
   ].filter(Boolean)
 
   if (webhookUrl) {
