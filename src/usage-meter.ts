@@ -29,6 +29,16 @@ type Counters = {
   // Size tracking
   totalRequestBytes: number
   totalResponseBytes: number
+  // Requests per model id, per tool name, and per UTC hour (24 buckets)
+  models: Record<string, number>
+  tools: Record<string, number>
+  hours: number[]
+  // Equivalent API cost in USD (the gateway itself is a subscription — see PRICES)
+  costUsd: number
+  // Requests whose model has no price entry, so costUsd under-reports them
+  unpricedReqs: number
+  // Largest single-request context (input + cache) seen
+  maxInputTokens: number
 }
 
 const emptyCounters = (): Counters => ({
@@ -45,7 +55,34 @@ const emptyCounters = (): Counters => ({
   maxLatencyMs: 0,
   totalRequestBytes: 0,
   totalResponseBytes: 0,
+  models: {},
+  tools: {},
+  hours: new Array(24).fill(0),
+  costUsd: 0,
+  unpricedReqs: 0,
+  maxInputTokens: 0,
 })
+
+// Preço equivalente de API, em US$ por milhão de tokens (a conta do gateway é
+// assinatura, não pay-per-token — isto é "quanto custaria via API").
+// Cache: escrita 1.25× a entrada (TTL 5min), leitura 0.1×.
+const PRICES: Record<string, { in: number; out: number }> = {
+  'claude-fable': { in: 10, out: 50 },
+  'claude-mythos': { in: 10, out: 50 },
+  'claude-opus': { in: 5, out: 25 },
+  'claude-sonnet': { in: 3, out: 15 },
+  'claude-haiku': { in: 1, out: 5 },
+}
+const CACHE_WRITE_MULT = 1.25
+const CACHE_READ_MULT = 0.1
+
+/** Preço do modelo, ou null se ele não estiver na tabela — nunca chuta valor. */
+function priceOf(model: string): { in: number; out: number } | null {
+  for (const [prefix, p] of Object.entries(PRICES)) {
+    if (model.startsWith(prefix)) return p
+  }
+  return null
+}
 
 const clients = new Map<string, Counters>()
 let since = new Date().toISOString()
@@ -76,6 +113,7 @@ function get(name: string): Counters {
 export function recordRequest(client: string, status: number): void {
   const c = get(client)
   c.requests++
+  c.hours[new Date().getUTCHours()]++
   if (status >= 400) {
     c.errors++
     if (status >= 500) {
@@ -116,7 +154,15 @@ type UsageLike = {
   cache_creation_input_tokens?: number
 }
 
-type Acc = { input: number; output: number; cacheRead: number; cacheCreate: number }
+type Acc = {
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreate: number
+  // Modelo que de fato atendeu (vem do próprio stream) e ferramentas chamadas.
+  model?: string
+  tools: Record<string, number>
+}
 
 function applyUsage(acc: Acc, u?: UsageLike): void {
   if (!u) return
@@ -136,7 +182,17 @@ function parseSSE(data: string, acc: Acc, clientDebug?: string): void {
   }
   // message_start carries input+cache tokens; message_delta carries the final
   // (authoritative) totals. Overwrite-on-present means the last one wins.
+  if (obj?.type === 'content_block_start') {
+    // tool_use / server_tool_use carregam o nome da ferramenta chamada.
+    const name = obj.content_block?.name
+    if (typeof name === 'string' && String(obj.content_block?.type || '').endsWith('tool_use')) {
+      // Teto de segurança: nomes de ferramenta são finitos na prática.
+      if (Object.keys(acc.tools).length < 50) acc.tools[name] = (acc.tools[name] || 0) + 1
+    }
+    return
+  }
   if (obj?.type === 'message_start') {
+    if (typeof obj.message?.model === 'string') acc.model = obj.message.model
     if (obj.message?.usage) {
       applyUsage(acc, obj.message.usage)
     } else if (clientDebug && obj.message) {
@@ -165,7 +221,7 @@ function parseSSE(data: string, acc: Acc, clientDebug?: string): void {
 export function attachUsage(client: string, res: IncomingMessage, status?: number): void {
   const ct = String(res.headers['content-type'] || '')
   const isSSE = ct.includes('event-stream')
-  const acc: Acc = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 }
+  const acc: Acc = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, tools: {} }
   let tail = ''
   let jsonBuf = ''
   const MAX_JSON = 2_000_000
@@ -201,7 +257,8 @@ export function attachUsage(client: string, res: IncomingMessage, status?: numbe
       const statusStr = status ? ` [${status}]` : ''
       if (!isSSE && jsonBuf) {
         try {
-          const j = JSON.parse(jsonBuf) as { usage?: UsageLike }
+          const j = JSON.parse(jsonBuf) as { usage?: UsageLike; model?: string }
+          if (typeof j.model === 'string') acc.model = j.model
           if (j.usage) {
             log('debug', `${client}: Non-SSE response${statusStr} contains usage: in=${j.usage.input_tokens} out=${j.usage.output_tokens}`)
             applyUsage(acc, j.usage)
@@ -225,6 +282,23 @@ export function attachUsage(client: string, res: IncomingMessage, status?: numbe
       c.outputTokens += acc.output
       c.cacheReadTokens += acc.cacheRead
       c.cacheCreationTokens += acc.cacheCreate
+      c.maxInputTokens = Math.max(c.maxInputTokens, acc.input + acc.cacheRead + acc.cacheCreate)
+      for (const [name, n] of Object.entries(acc.tools)) c.tools[name] = (c.tools[name] || 0) + n
+      if (acc.model) {
+        c.models[acc.model] = (c.models[acc.model] || 0) + 1
+        const p = priceOf(acc.model)
+        if (p) {
+          c.costUsd +=
+            (acc.input * p.in +
+              acc.cacheCreate * p.in * CACHE_WRITE_MULT +
+              acc.cacheRead * p.in * CACHE_READ_MULT +
+              acc.output * p.out) /
+            1_000_000
+        } else {
+          // Sem preço conhecido: conta o furo em vez de inventar um valor.
+          c.unpricedReqs++
+        }
+      }
       dirty = true
     } catch (err) {
       log('warn', `${client}: Usage parsing failed: ${err}`)
@@ -305,6 +379,28 @@ export function bar(frac: number, width = 18): string {
 
 // Dourado do trono.
 const GOLD = 0xf1c40f
+
+const SPARK = '▁▂▃▄▅▆▇█'
+// Fuso do reino: America/Sao_Paulo (sem horário de verão desde 2019).
+const TZ_OFFSET = -3
+
+/** Buckets UTC → buckets locais, index 0 = 00h local. */
+function toLocalHours(utc: number[]): number[] {
+  return Array.from({ length: 24 }, (_, h) => utc[(h - TZ_OFFSET + 24) % 24] || 0)
+}
+
+/** Sparkline de 24 caracteres — monospace, precisa ir dentro de crase. */
+function sparkline(buckets: number[]): string {
+  const max = Math.max(...buckets, 1)
+  return buckets.map((n) => (n ? SPARK[Math.min(7, Math.floor((n / max) * 7.999))] : '·')).join('')
+}
+
+/** Top-N entradas de um contador {chave: quantidade}. */
+function topN(counts: Record<string, number>, n: number): [string, number][] {
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+}
 
 // Tema medieval: coroa pro trono, insígnias pra corte, enxada pro resto.
 const RANK = ['👑', '🗡️', '🛡️', '🏹']
@@ -390,6 +486,69 @@ export function summaryEmbed(): DiscordEmbed {
     })
   }
 
+  // Aproveitamento de cache: quanto da entrada veio de cache (barato) em vez de nova.
+  const cacheRate = (c: Counters) => (allIn(c) ? c.cacheReadTokens / allIn(c) : 0)
+  const [cacheKing, cacheKingC] = best(cacheRate)
+  if (allIn(cacheKingC)) {
+    awards.push({
+      name: '🧠 Melhor cache',
+      value: `${cacheKing}\n${(cacheRate(cacheKingC) * 100).toFixed(1)}% de reaproveitamento`,
+      inline: true,
+    })
+  }
+
+  // Coruja: maior fatia de requisições na madrugada (00h–05h locais).
+  const nightShare = (c: Counters) =>
+    c.requests >= 20 ? toLocalHours(c.hours).slice(0, 6).reduce((s, n) => s + n, 0) / c.requests : 0
+  const [owl, owlC] = best(nightShare)
+  if (nightShare(owlC) > 0) {
+    awards.push({
+      name: '🦉 Coruja',
+      value: `${owl}\n${(nightShare(owlC) * 100).toFixed(0)}% das reqs 00h–05h`,
+      inline: true,
+    })
+  }
+
+  // Contexto: maior requisição única já vista no reino.
+  const [ctxLord, ctxLordC] = best((c) => c.maxInputTokens)
+  if (ctxLordC.maxInputTokens) {
+    awards.push({
+      name: '📚 Maior contexto',
+      value: `${ctxLord}\n${fmt(ctxLordC.maxInputTokens)} tokens numa req só`,
+      inline: true,
+    })
+  }
+
+  // Agregados do reino: custo, modelos, ferramentas, ritmo por hora.
+  const merge = (pick: (c: Counters) => Record<string, number>) => {
+    const out: Record<string, number> = {}
+    for (const [, c] of rows) {
+      for (const [k, n] of Object.entries(pick(c) || {})) out[k] = (out[k] || 0) + n
+    }
+    return out
+  }
+  // Agrupa por família (claude-opus-4-8 → opus); ninguém quer ler o id inteiro.
+  const family = (m: string) => m.replace(/^claude-/, '').split('-')[0]
+  const models = merge((c) => c.models)
+  const modelReqs = Object.values(models).reduce((s, n) => s + n, 0)
+  const byFamily: Record<string, number> = {}
+  for (const [m, n] of Object.entries(models)) byFamily[family(m)] = (byFamily[family(m)] || 0) + n
+  const modelLine = topN(byFamily, 4)
+    .map(([f, n]) => `${f} ${((n / (modelReqs || 1)) * 100).toFixed(0)}%`)
+    .join(' · ')
+
+  const tools = merge((c) => c.tools)
+  const toolLine = topN(tools, 5)
+    .map(([t, n]) => `${t} ${fmt(n)}`)
+    .join(' · ')
+
+  const cost = sum((c) => c.costUsd)
+  const unpriced = sum((c) => c.unpricedReqs)
+  const kingdomHours = toLocalHours(
+    Array.from({ length: 24 }, (_, h) => sum((c) => c.hours?.[h] || 0)),
+  )
+  const peak = kingdomHours.indexOf(Math.max(...kingdomHours))
+
   return cache({
     description: [
       `👑 **${rows[0][0]}** reina com **${fmt(top)}** tokens queimados.`,
@@ -400,18 +559,32 @@ export function summaryEmbed(): DiscordEmbed {
     fields: [
       {
         name: '🏰 O reino inteiro',
-        value:
+        value: [
           `**${fmt(grand)} tokens** em ${tReq} reqs` +
-          (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
-          ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
+            (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
+            ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
+          cost || unpriced
+            ? `💰 **US$ ${cost.toFixed(2)}** equivalentes em API` +
+              (unpriced ? ` (${unpriced} reqs sem preço)` : '')
+            : null,
+          modelLine ? `🤖 ${modelLine}` : null,
+        ]
+          .filter(Boolean)
+          .join('\n'),
       },
+      // Só aparecem quando já há dado — placar recém-zerado não mostra campo vazio.
+      ...(kingdomHours.some(Boolean)
+        ? [
+            {
+              name: '🕰️ Ritmo do reino (hora local)',
+              value: `\`00h ${sparkline(kingdomHours)} 23h\`\npico às ${String(peak).padStart(2, '0')}h`,
+            },
+          ]
+        : []),
+      ...(toolLine ? [{ name: '🔧 Ferramentas mais empunhadas', value: toolLine }] : []),
       ...awards,
     ],
-    footer: {
-      text:
-        `desde ${sinceStr} · o reino zera a cada janela de 7 dias\n` +
-        'barra = consumo em relação ao líder · tokens = entrada + cache + saída · % = fatia do total · 💥 = reqs com erro',
-    },
+    footer: { text: `desde ${sinceStr}` },
   })
 }
 
