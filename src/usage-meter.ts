@@ -486,7 +486,7 @@ export function summaryEmbed(): DiscordEmbed {
   }
   if (slowC.maxLatencyMs) {
     awards.push({
-      name: '⏳ Requisição mais longa',
+      name: '⏳ Requisição mais demorada',
       value: `${slow}\n${dur(slowC.maxLatencyMs)} numa req só`,
       inline: true,
     })
