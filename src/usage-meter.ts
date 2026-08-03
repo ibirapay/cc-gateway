@@ -517,14 +517,12 @@ export function summaryEmbed(): DiscordEmbed {
     })
   }
 
-  // Coruja: maior fatia de requisições na madrugada (00h–05h locais).
-  const nightShare = (c: Counters) =>
-    c.requests >= 20 ? toLocalHours(c.hours).slice(0, 6).reduce((s, n) => s + n, 0) / c.requests : 0
-  const [owl, owlC] = best(nightShare)
-  if (nightShare(owlC) > 0) {
+  // Custo por cliente: diverge do placar de tokens quando os modelos diferem.
+  const [priciest, priciestC] = best((c) => c.costUsd)
+  if (priciestC.costUsd > 0) {
     awards.push({
-      name: '🦉 Coruja',
-      value: `${owl}\n${(nightShare(owlC) * 100).toFixed(0)}% das reqs`,
+      name: '💸 Mais caro',
+      value: `${priciest}\nUS$ ${priciestC.costUsd.toFixed(2)}`,
       inline: true,
     })
   }
