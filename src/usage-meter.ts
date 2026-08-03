@@ -395,6 +395,12 @@ function sparkline(buckets: number[]): string {
   return buckets.map((n) => (n ? SPARK[Math.min(7, Math.floor((n / max) * 7.999))] : '·')).join('')
 }
 
+/** ms → "4m47s" / "38s". */
+function dur(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`
+}
+
 /** Top-N entradas de um contador {chave: quantidade}. */
 function topN(counts: Record<string, number>, n: number): [string, number][] {
   return Object.entries(counts)
@@ -467,7 +473,7 @@ export function summaryEmbed(): DiscordEmbed {
     rows.reduce((a, b) => (score(b[1]) > score(a[1]) ? b : a))
   const [chatty, chattyC] = best((c) => c.outputTokens)
   const [crasher, crasherC] = best((c) => c.errors)
-  const [slow, slowC] = best((c) => (c.requests ? c.totalLatencyMs / c.requests : 0))
+  const [slow, slowC] = best((c) => c.maxLatencyMs)
   const awards: NonNullable<DiscordEmbed['fields']> = [
     { name: '📤 Mais tokens gerados', value: `${chatty}\n${fmt(chattyC.outputTokens)} tokens`, inline: true },
   ]
@@ -478,10 +484,10 @@ export function summaryEmbed(): DiscordEmbed {
       inline: true,
     })
   }
-  if (slowC.requests) {
+  if (slowC.maxLatencyMs) {
     awards.push({
-      name: '⏱️ Mais lento',
-      value: `${slow}\n${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média`,
+      name: '⏳ Requisição mais longa',
+      value: `${slow}\n${dur(slowC.maxLatencyMs)} numa req só`,
       inline: true,
     })
   }
