@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import { log } from './logger.js'
 import { sendDiscord } from './discord.js'
-import { resetCounters } from './usage-meter.js'
+import { bar, resetCounters } from './usage-meter.js'
 
 // Fire a Discord notification each time the shared account's 7-day usage
 // crosses a new BAND_STEP% band (5, 10, 15, … 100). Anthropic returns the
@@ -115,7 +115,10 @@ export function maybeNotifyUsage(
     if (webhookUrl) {
       void sendDiscord(
         webhookUrl,
-        `🔄 **CC Gateway usage reset** — 7-day window rolled over, now at **${pct.toFixed(1)}%**. Per-user counters reset.`,
+        [
+          `🔄 **CC Gateway usage reset** — 7-day window rolled over. Fresh scoreboard, everyone back to zero.`,
+          `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
+        ].join('\n'),
       )
     }
     return
@@ -137,8 +140,10 @@ export function maybeNotifyUsage(
 
   const lines = [
     `${emoji} **CC Gateway usage crossed ${band}%**`,
-    `7-day: **${pct.toFixed(1)}%** (status: \`${status}\`)`,
-    fiveH !== undefined ? `5-hour: ${(Number(fiveH) * 100).toFixed(1)}%` : null,
+    `\`7d ${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%** (\`${status}\`)`,
+    fiveH !== undefined
+      ? `\`5h ${bar(Number(fiveH), 20)}\` ${(Number(fiveH) * 100).toFixed(1)}%`
+      : null,
     `7-day resets: ${resetStr}`,
   ].filter(Boolean)
 

@@ -281,14 +281,36 @@ export function resetCounters(): void {
 }
 
 function fmt(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
   return String(n)
 }
 
+// Eighth-block partials so short bars still show something.
+const EIGHTHS = '▏▎▍▌▋▊▉█'
+
 /**
- * Generate a formatted usage summary for Discord reporting.
- * Lists per-client token usage and error counts, sorted by total tokens used.
+ * Render a horizontal bar for Discord. Monospace only — callers must wrap it in
+ * a code block (or backticks) or Discord's proportional font will misalign it.
+ * @param frac - 0..1 fill ratio (clamped)
+ * @param width - bar width in characters
+ */
+export function bar(frac: number, width = 18): string {
+  const units = Math.max(0, Math.min(1, frac || 0)) * width * 8
+  const full = Math.floor(units / 8)
+  const rest = Math.round(units % 8)
+  return ('█'.repeat(full) + (rest ? EIGHTHS[rest - 1] : '')).padEnd(width, '·')
+}
+
+// Podium first, plain keycaps after. Nobody gets a crown for 11th place.
+const RANK = ['👑', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
+
+/**
+ * Generate the per-user usage leaderboard for Discord: a ranked bar chart of
+ * token burn (crown for the top spender) plus joke awards, all derived from the
+ * existing counters. The board goes in a code block — Discord's proportional
+ * font would otherwise shred the alignment.
  * Results are cached for 30 seconds to avoid recalculation on frequent calls.
  * @returns Formatted markdown string with per-client and total usage
  */
@@ -300,46 +322,70 @@ export function summaryText(): string {
   }
 
   const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
-  const rows = [...clients.entries()].sort(
-    (a, b) => allIn(b[1]) + b[1].outputTokens - (allIn(a[1]) + a[1].outputTokens),
-  )
+  const total = (c: Counters) => allIn(c) + c.outputTokens
+  const rows = [...clients.entries()].sort((a, b) => total(b[1]) - total(a[1]))
   const sinceStr = since.slice(0, 16).replace('T', ' ') + ' UTC'
-  if (!rows.length) {
-    const summary = `📇 **CC Gateway — per-user usage**\nNo requests recorded since ${sinceStr}.`
-    cachedSummary = summary
+  const cache = (s: string): string => {
+    cachedSummary = s
     cachedSummaryTime = now
-    return summary
+    return s
   }
-  let tReq = 0
-  let tIn = 0
-  let tOut = 0
-  let tErr = 0
-  let tErr4xx = 0
-  let tErr5xx = 0
-  const lines = rows.map(([name, c]) => {
-    const inTok = allIn(c)
-    tReq += c.requests
-    tIn += inTok
-    tOut += c.outputTokens
-    tErr += c.errors
-    tErr4xx += c.errors4xx
-    tErr5xx += c.errors5xx
-    const tot = inTok + c.outputTokens
-    const errStr = c.errors ? ` (${c.errors4xx}×4xx ${c.errors5xx}×5xx)` : ''
-    const avgLatency = c.requests > 0 ? (c.totalLatencyMs / c.requests).toFixed(0) : 0
-    const sizeStr = ` [req ${fmt(c.totalRequestBytes)} / res ${fmt(c.totalResponseBytes)}]`
-    return `• **${name}** — ${c.requests} req${errStr}, ${fmt(tot)} tok (in ${fmt(inTok)} / out ${fmt(c.outputTokens)}), avg ${avgLatency}ms${sizeStr}`
-  })
-  const avgLatency = tReq > 0 ? (rows.reduce((sum, [_, c]) => sum + c.totalLatencyMs, 0) / tReq).toFixed(0) : 0
-  const summary = [
-    `📇 **CC Gateway — per-user usage** (since ${sinceStr})`,
-    ...lines,
-    `— total: ${tReq} req, ${tErr > 0 ? `${tErr4xx}×4xx ${tErr5xx}×5xx, ` : ''}${fmt(tIn + tOut)} tok (in ${fmt(tIn)} / out ${fmt(tOut)}), avg ${avgLatency}ms`,
-  ].join('\n')
+  if (!rows.length) {
+    return cache(
+      `👑 **CC Gateway — Token Throne**\nThrone empty: not one token burned since ${sinceStr}. Suspicious.`,
+    )
+  }
 
-  cachedSummary = summary
-  cachedSummaryTime = now
-  return summary
+  const sum = (f: (c: Counters) => number) => rows.reduce((s, [, c]) => s + f(c), 0)
+  const grand = sum(total)
+  const top = total(rows[0][1]) || 1
+  const nameW = Math.max(...rows.map(([n]) => Math.min(12, n.length)))
+  const tReq = sum((c) => c.requests)
+  const tErr4xx = sum((c) => c.errors4xx)
+  const tErr5xx = sum((c) => c.errors5xx)
+
+  const board = rows.map(([name, c], i) =>
+    [
+      RANK[i] || `${i + 1}.`,
+      name.slice(0, nameW).padEnd(nameW),
+      bar(total(c) / top),
+      fmt(total(c)).padStart(6),
+      `${((total(c) / (grand || 1)) * 100).toFixed(0).padStart(3)}%`,
+      `${String(c.requests).padStart(5)} req`,
+      c.errors ? `💥${c.errors}` : '',
+    ]
+      .join(' ')
+      .trimEnd(),
+  )
+
+  // Joke awards — same counters, no extra bookkeeping.
+  const best = (score: (c: Counters) => number) =>
+    rows.reduce((a, b) => (score(b[1]) > score(a[1]) ? b : a))
+  const [chatty, chattyC] = best((c) => c.outputTokens)
+  const [crasher, crasherC] = best((c) => c.errors)
+  const [slow, slowC] = best((c) => (c.requests ? c.totalLatencyMs / c.requests : 0))
+  const awards = [
+    `🗣️ **Motormouth**: ${chatty} (${fmt(chattyC.outputTokens)} out)`,
+    crasherC.errors ? `💥 **Crash-test dummy**: ${crasher} (${crasherC.errors})` : null,
+    slowC.requests
+      ? `🐢 **Slowpoke**: ${slow} (${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s avg)`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  return cache(
+    [
+      `👑 **CC Gateway — Token Throne** · since ${sinceStr}`,
+      '```',
+      ...board,
+      '```',
+      `🏦 **${fmt(grand)} tok** across ${tReq} req` +
+        (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
+        ` · avg ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s`,
+      awards,
+    ].join('\n'),
+  )
 }
 
 /**
