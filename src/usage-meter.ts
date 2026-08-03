@@ -373,18 +373,18 @@ export function summaryEmbed(): DiscordEmbed {
   const [crasher, crasherC] = best((c) => c.errors)
   const [slow, slowC] = best((c) => (c.requests ? c.totalLatencyMs / c.requests : 0))
   const awards: NonNullable<DiscordEmbed['fields']> = [
-    { name: '🪶 Corvo Tagarela', value: `${chatty}\n${fmt(chattyC.outputTokens)} gerados`, inline: true },
+    { name: '📤 Mais tokens gerados', value: `${chatty}\n${fmt(chattyC.outputTokens)} tokens`, inline: true },
   ]
   if (crasherC.errors) {
     awards.push({
-      name: '🛡️ Escudo Rachado',
-      value: `${crasher}\n${crasherC.errors} reqs tombadas`,
+      name: '💥 Mais erros',
+      value: `${crasher}\n${crasherC.errors} reqs`,
       inline: true,
     })
   }
   if (slowC.requests) {
     awards.push({
-      name: '🐌 Carroça de Bois',
+      name: '⏱️ Mais lento',
       value: `${slow}\n${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média`,
       inline: true,
     })
