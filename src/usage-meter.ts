@@ -84,6 +84,13 @@ function priceOf(model: string): { in: number; out: number } | null {
   return null
 }
 
+const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
+const total = (c: Counters) => allIn(c) + c.outputTokens
+
+// Foto do placar na virada da janela de 7 dias, pra comparar temporadas.
+type Snapshot = { until: string; clients: Record<string, number> }
+let previous: Snapshot | null = null
+
 const clients = new Map<string, Counters>()
 let since = new Date().toISOString()
 let statePath: string | null = null
@@ -313,9 +320,11 @@ function load(): void {
   try {
     const s = JSON.parse(readFileSync(statePath, 'utf-8')) as {
       since?: string
+      previous?: Snapshot
       clients?: Record<string, Partial<Counters>>
     }
     if (s.since) since = s.since
+    if (s.previous?.clients) previous = s.previous
     if (s.clients) {
       for (const [k, v] of Object.entries(s.clients)) {
         clients.set(k, { ...emptyCounters(), ...v })
@@ -332,6 +341,7 @@ function persist(): void {
     const obj = {
       since,
       updated: new Date().toISOString(),
+      previous,
       clients: Object.fromEntries(clients),
     }
     writeFileSync(statePath, JSON.stringify(obj, null, 2), { mode: 0o600 })
@@ -347,6 +357,12 @@ function persist(): void {
  * Updates the usage start time and persists state to disk.
  */
 export function resetCounters(): void {
+  if (clients.size) {
+    previous = {
+      until: new Date().toISOString(),
+      clients: Object.fromEntries([...clients].map(([n, c]) => [n, total(c)])),
+    }
+  }
   clients.clear()
   since = new Date().toISOString()
   dirty = true
@@ -401,6 +417,12 @@ function dur(ms: number): string {
   return s >= 60 ? `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s` : `${s}s`
 }
 
+/** ms → "16h20" / "45min". */
+function hrs(ms: number): string {
+  const min = Math.round(ms / 60000)
+  return min >= 60 ? `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}` : `${min}min`
+}
+
 /** Top-N entradas de um contador {chave: quantidade}. */
 function topN(counts: Record<string, number>, n: number): [string, number][] {
   return Object.entries(counts)
@@ -427,8 +449,6 @@ export function summaryEmbed(): DiscordEmbed {
     return cachedSummary
   }
 
-  const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
-  const total = (c: Counters) => allIn(c) + c.outputTokens
   const rows = [...clients.entries()].sort((a, b) => total(b[1]) - total(a[1]))
   const sinceStr = since.slice(0, 16).replace('T', ' ') + ' UTC'
   const cache = (e: DiscordEmbed): DiscordEmbed => {
@@ -474,9 +494,14 @@ export function summaryEmbed(): DiscordEmbed {
   const [chatty, chattyC] = best((c) => c.outputTokens)
   const [crasher, crasherC] = best((c) => c.errors)
   const [slow, slowC] = best((c) => c.maxLatencyMs)
-  const awards: NonNullable<DiscordEmbed['fields']> = [
-    { name: '📤 Mais tokens gerados', value: `${chatty}\n${fmt(chattyC.outputTokens)} tokens`, inline: true },
-  ]
+  const awards: NonNullable<DiscordEmbed['fields']> = []
+  if (chattyC.outputTokens) {
+    awards.push({
+      name: '📤 Mais tokens gerados',
+      value: `${chatty}\n${fmt(chattyC.outputTokens)} tokens`,
+      inline: true,
+    })
+  }
   if (crasherC.errors) {
     awards.push({
       name: '💥 Mais erros',
@@ -495,7 +520,7 @@ export function summaryEmbed(): DiscordEmbed {
   // Aproveitamento de cache: quanto da entrada veio de cache (barato) em vez de nova.
   const cacheRate = (c: Counters) => (allIn(c) ? c.cacheReadTokens / allIn(c) : 0)
   const [cacheKing, cacheKingC] = best(cacheRate)
-  if (allIn(cacheKingC)) {
+  if (cacheRate(cacheKingC) > 0) {
     awards.push({
       name: '🧠 Melhor cache',
       value: `${cacheKing}\n${(cacheRate(cacheKingC) * 100).toFixed(1)}% de reaproveitamento`,
@@ -524,6 +549,31 @@ export function summaryEmbed(): DiscordEmbed {
       inline: true,
     })
   }
+
+  // Horas de Claude Code: latência somada = tempo de modelo rodando pra esse lorde.
+  const [busiest, busiestC] = best((c) => c.totalLatencyMs)
+  if (busiestC.totalLatencyMs) {
+    awards.push({
+      name: '🕯️ Mais horas de Claude Code',
+      value: `${busiest}\n${hrs(busiestC.totalLatencyMs)} de modelo rodando`,
+      inline: true,
+    })
+  }
+
+  // Temporada anterior: variação por lorde e do reino (só existe após o 1º reset).
+  const pct = (now: number, before: number) => ((now - before) / before) * 100
+  const arrow = (d: number) => `${d >= 0 ? '▲' : '▼'}${Math.abs(d).toFixed(0)}%`
+  const deltaLine = previous
+    ? rows
+        .map(([name, c]) => {
+          const before = previous!.clients[name]
+          return before ? `${name} ${arrow(pct(total(c), before))}` : `${name} 🆕`
+        })
+        .join(' · ')
+    : ''
+  const prevGrand = previous
+    ? Object.values(previous.clients).reduce((a, b) => a + b, 0)
+    : 0
 
   // Agregados do reino: custo, modelos, ferramentas, ritmo por hora.
   const merge = (pick: (c: Counters) => Record<string, number>) => {
@@ -574,6 +624,8 @@ export function summaryEmbed(): DiscordEmbed {
               (unpriced ? ` (${unpriced} reqs sem preço)` : '')
             : null,
           modelLine ? `🤖 ${modelLine}` : null,
+          `🕯️ ${hrs(sum((c) => c.totalLatencyMs))} de Claude Code rodando` +
+            (prevGrand ? ` · 📈 ${arrow(pct(grand, prevGrand))} vs a janela anterior` : ''),
         ]
           .filter(Boolean)
           .join('\n'),
@@ -588,6 +640,14 @@ export function summaryEmbed(): DiscordEmbed {
           ]
         : []),
       ...(toolLine ? [{ name: '🔧 Ferramentas mais empunhadas', value: toolLine }] : []),
+      ...(deltaLine
+        ? [
+            {
+              name: `📈 Contra a janela anterior (até ${previous!.until.slice(5, 10).split('-').reverse().join('/')})`,
+              value: deltaLine,
+            },
+          ]
+        : []),
       ...awards,
     ],
     footer: { text: `desde ${sinceStr}` },
