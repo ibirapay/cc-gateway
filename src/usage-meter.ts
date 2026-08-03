@@ -512,18 +512,7 @@ export function summaryEmbed(): DiscordEmbed {
   if (slowC.maxLatencyMs) {
     awards.push({
       name: '⏳ Requisição mais demorada',
-      value: `${slow}\n${dur(slowC.maxLatencyMs)} numa req só`,
-      inline: true,
-    })
-  }
-
-  // Aproveitamento de cache: quanto da entrada veio de cache (barato) em vez de nova.
-  const cacheRate = (c: Counters) => (allIn(c) ? c.cacheReadTokens / allIn(c) : 0)
-  const [cacheKing, cacheKingC] = best(cacheRate)
-  if (cacheRate(cacheKingC) > 0) {
-    awards.push({
-      name: '🧠 Melhor cache',
-      value: `${cacheKing}\n${(cacheRate(cacheKingC) * 100).toFixed(1)}% de reaproveitamento`,
+      value: `${slow}\n${dur(slowC.maxLatencyMs)}`,
       inline: true,
     })
   }
@@ -535,7 +524,7 @@ export function summaryEmbed(): DiscordEmbed {
   if (nightShare(owlC) > 0) {
     awards.push({
       name: '🦉 Coruja',
-      value: `${owl}\n${(nightShare(owlC) * 100).toFixed(0)}% das reqs 00h–05h`,
+      value: `${owl}\n${(nightShare(owlC) * 100).toFixed(0)}% das reqs`,
       inline: true,
     })
   }
@@ -545,7 +534,7 @@ export function summaryEmbed(): DiscordEmbed {
   if (ctxLordC.maxInputTokens) {
     awards.push({
       name: '📚 Maior contexto',
-      value: `${ctxLord}\n${fmt(ctxLordC.maxInputTokens)} tokens numa req só`,
+      value: `${ctxLord}\n${fmt(ctxLordC.maxInputTokens)} tokens`,
       inline: true,
     })
   }
@@ -555,7 +544,7 @@ export function summaryEmbed(): DiscordEmbed {
   if (busiestC.totalLatencyMs) {
     awards.push({
       name: '🕯️ Mais horas de Claude Code',
-      value: `${busiest}\n${hrs(busiestC.totalLatencyMs)} de modelo rodando`,
+      value: `${busiest}\n${hrs(busiestC.totalLatencyMs)}`,
       inline: true,
     })
   }
@@ -598,6 +587,7 @@ export function summaryEmbed(): DiscordEmbed {
     .map(([t, n]) => `${t} ${fmt(n)}`)
     .join(' · ')
 
+  const kingdomIn = sum(allIn)
   const cost = sum((c) => c.costUsd)
   const unpriced = sum((c) => c.unpricedReqs)
   const kingdomHours = toLocalHours(
@@ -619,13 +609,19 @@ export function summaryEmbed(): DiscordEmbed {
           `**${fmt(grand)} tokens** em ${tReq} reqs` +
             (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
             ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
-          cost || unpriced
-            ? `💰 **US$ ${cost.toFixed(2)}** equivalentes em API` +
-              (unpriced ? ` (${unpriced} reqs sem preço)` : '')
-            : null,
-          modelLine ? `🤖 ${modelLine}` : null,
-          `🕯️ ${hrs(sum((c) => c.totalLatencyMs))} de Claude Code rodando` +
-            (prevGrand ? ` · 📈 ${arrow(pct(grand, prevGrand))} vs a janela anterior` : ''),
+          [
+            cost || unpriced
+              ? `💰 US$ ${cost.toFixed(2)}` + (unpriced ? ` (${unpriced} reqs sem preço)` : '')
+              : null,
+            // Média do reino, ponderada por token — não é a média das médias.
+            kingdomIn ? `🧠 ${((sum((c) => c.cacheReadTokens) / kingdomIn) * 100).toFixed(0)}% de cache` : null,
+          ]
+            .filter(Boolean)
+            .join(' · ') || null,
+          [`🕯️ ${hrs(sum((c) => c.totalLatencyMs))} de Claude Code`, modelLine ? `🤖 ${modelLine}` : null]
+            .filter(Boolean)
+            .join(' · '),
+          prevGrand ? `📈 ${arrow(pct(grand, prevGrand))} vs a janela anterior` : null,
         ]
           .filter(Boolean)
           .join('\n'),
