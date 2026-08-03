@@ -306,11 +306,9 @@ export function bar(frac: number, width = 18): string {
 // Dourado do trono.
 const GOLD = 0xf1c40f
 
-// Tema Game of Tokens: coroa pro trono, insígnias pra corte, enxada pro resto.
+// Tema medieval: coroa pro trono, insígnias pra corte, enxada pro resto.
 const RANK = ['👑', '🗡️', '🛡️', '🏹']
 const PEASANT = '🌾'
-// Título da corte — só o dono do trono ganha um.
-const KING_TITLE = 'Primeiro de Seu Nome, Queimador de Cache, Protetor do Contexto'
 
 /**
  * Build the per-user usage leaderboard as a Discord embed: a ranked bar chart of
@@ -334,7 +332,7 @@ export function summaryEmbed(): DiscordEmbed {
   const cache = (e: DiscordEmbed): DiscordEmbed => {
     cachedSummary = {
       ...e,
-      title: '⚔️ Game of Tokens — o Trono de Ferro',
+      title: '⚔️ Game of Tokens',
       color: GOLD,
       timestamp: new Date(now).toISOString(),
     }
@@ -343,7 +341,7 @@ export function summaryEmbed(): DiscordEmbed {
   }
   if (!rows.length) {
     return cache({
-      description: `O Trono de Ferro está vazio: nenhum lorde queimou um token desde ${sinceStr}. Conspiração?`,
+      description: `O trono está vazio: nenhum lorde queimou um token desde ${sinceStr}. Suspeito.`,
     })
   }
 
@@ -362,7 +360,6 @@ export function summaryEmbed(): DiscordEmbed {
       bar(total(c) / top),
       fmt(total(c)).padStart(6),
       `${((total(c) / (grand || 1)) * 100).toFixed(0).padStart(3)}%`,
-      `${String(c.requests).padStart(5)} req`,
       c.errors ? `💥${c.errors}` : '',
     ]
       .join(' ')
@@ -380,14 +377,14 @@ export function summaryEmbed(): DiscordEmbed {
   ]
   if (crasherC.errors) {
     awards.push({
-      name: '☠️ Casamento Vermelho',
+      name: '🛡️ Escudo Rachado',
       value: `${crasher}\n${crasherC.errors} reqs tombadas`,
       inline: true,
     })
   }
   if (slowC.requests) {
     awards.push({
-      name: '❄️ Lento como o Inverno',
+      name: '🐌 Carroça de Bois',
       value: `${slow}\n${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média`,
       inline: true,
     })
@@ -395,7 +392,7 @@ export function summaryEmbed(): DiscordEmbed {
 
   return cache({
     description: [
-      `👑 **${rows[0][0]}**, ${KING_TITLE} — **${fmt(top)}** tokens queimados.`,
+      `👑 **${rows[0][0]}** reina com **${fmt(top)}** tokens queimados.`,
       '```',
       ...board,
       '```',
@@ -412,7 +409,7 @@ export function summaryEmbed(): DiscordEmbed {
     ],
     footer: {
       text:
-        `desde ${sinceStr} · o Inverno chega a cada 7 dias e zera o reino\n` +
+        `desde ${sinceStr} · o reino zera a cada janela de 7 dias\n` +
         'barra = consumo em relação ao líder · tokens = entrada + cache + saída · % = fatia do total · 💥 = reqs com erro',
     },
   })

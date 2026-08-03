@@ -122,13 +122,13 @@ export function maybeNotifyUsage(
       void sendDiscord(webhookUrl, {
         embeds: [
           {
-            title: '🔄 A Longa Noite passou — o Trono de Ferro está vazio',
+            title: '🔄 Nova era no reino — o trono está vazio',
             description:
               'A janela de 7 dias virou. Placar zerado, que comecem os jogos.\n' +
               `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
             color: BLUE,
             footer: {
-              text: 'a janela de 7 dias é da conta compartilhada; o Game of Tokens recomeça junto',
+              text: 'a janela de 7 dias é da conta compartilhada; o placar recomeça junto',
             },
             timestamp: new Date().toISOString(),
           },
@@ -153,9 +153,9 @@ export function maybeNotifyUsage(
   const color = band >= 90 ? RED : band >= 75 ? ORANGE : GREEN
   const herald =
     band >= 90
-      ? `🚨 A Muralha está caindo — o reino já queimou ${band}%`
+      ? `🚨 O castelo está caindo — o reino já queimou ${band}%`
       : band >= 75
-        ? `⚠️ Caminhantes Brancos avistados — ${band}% do reino queimado`
+        ? `⚠️ Cerco ao castelo — ${band}% do reino queimado`
         : `📜 Os corvos anunciam: ${band}% do reino queimado`
 
   const embed = {
@@ -169,7 +169,7 @@ export function maybeNotifyUsage(
     color,
     fields: [
       { name: 'status', value: `\`${status}\``, inline: true },
-      { name: '❄️ o Inverno (reset de 7d) chega em', value: resetStr, inline: true },
+      { name: '⏳ o reino zera em', value: resetStr, inline: true },
     ],
     footer: {
       text: '7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · quem queimou o quê sai no ⚔️ Game of Tokens',
