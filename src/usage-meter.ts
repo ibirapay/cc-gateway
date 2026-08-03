@@ -2,7 +2,7 @@ import type { IncomingMessage } from 'http'
 import { readFileSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
 import { log } from './logger.js'
-import { sendDiscord } from './discord.js'
+import { sendDiscord, type DiscordEmbed } from './discord.js'
 
 // Per-sub-user (per client-token) usage metering. Anthropic's rate-limit
 // headers are account-wide for the shared OAuth account, so the only place we
@@ -53,8 +53,8 @@ let statePath: string | null = null
 let webhookUrl: string | null = null
 let dirty = false
 
-// Summary text caching with TTL (30 seconds)
-let cachedSummary: string | null = null
+// Embed caching with TTL (30 seconds)
+let cachedSummary: DiscordEmbed | null = null
 let cachedSummaryTime = 0
 const SUMMARY_CACHE_TTL_MS = 30_000
 
@@ -303,18 +303,24 @@ export function bar(frac: number, width = 18): string {
   return ('█'.repeat(full) + (rest ? EIGHTHS[rest - 1] : '')).padEnd(width, '·')
 }
 
-// Podium first, plain keycaps after. Nobody gets a crown for 11th place.
-const RANK = ['👑', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟']
+// Dourado do trono.
+const GOLD = 0xf1c40f
+
+// Tema Game of Tokens: coroa pro trono, insígnias pra corte, enxada pro resto.
+const RANK = ['👑', '🗡️', '🛡️', '🏹']
+const PEASANT = '🌾'
+// Título da corte — só o dono do trono ganha um.
+const KING_TITLE = 'Primeiro de Seu Nome, Queimador de Cache, Protetor do Contexto'
 
 /**
- * Generate the per-user usage leaderboard for Discord: a ranked bar chart of
+ * Build the per-user usage leaderboard as a Discord embed: a ranked bar chart of
  * token burn (crown for the top spender) plus joke awards, all derived from the
  * existing counters. The board goes in a code block — Discord's proportional
  * font would otherwise shred the alignment.
  * Results are cached for 30 seconds to avoid recalculation on frequent calls.
- * @returns Formatted markdown string with per-client and total usage
+ * @returns Discord embed with per-client and total usage
  */
-export function summaryText(): string {
+export function summaryEmbed(): DiscordEmbed {
   const now = Date.now()
   // Return cached summary if still fresh
   if (cachedSummary && now - cachedSummaryTime < SUMMARY_CACHE_TTL_MS) {
@@ -325,15 +331,20 @@ export function summaryText(): string {
   const total = (c: Counters) => allIn(c) + c.outputTokens
   const rows = [...clients.entries()].sort((a, b) => total(b[1]) - total(a[1]))
   const sinceStr = since.slice(0, 16).replace('T', ' ') + ' UTC'
-  const cache = (s: string): string => {
-    cachedSummary = s
+  const cache = (e: DiscordEmbed): DiscordEmbed => {
+    cachedSummary = {
+      ...e,
+      title: '⚔️ Game of Tokens — o Trono de Ferro',
+      color: GOLD,
+      timestamp: new Date(now).toISOString(),
+    }
     cachedSummaryTime = now
-    return s
+    return cachedSummary
   }
   if (!rows.length) {
-    return cache(
-      `👑 **CC Gateway — Trono dos Tokens**\nTrono vazio: nenhum token queimado desde ${sinceStr}. Suspeito.`,
-    )
+    return cache({
+      description: `O Trono de Ferro está vazio: nenhum lorde queimou um token desde ${sinceStr}. Conspiração?`,
+    })
   }
 
   const sum = (f: (c: Counters) => number) => rows.reduce((s, [, c]) => s + f(c), 0)
@@ -346,7 +357,7 @@ export function summaryText(): string {
 
   const board = rows.map(([name, c], i) =>
     [
-      RANK[i] || `${i + 1}.`,
+      RANK[i] || PEASANT,
       name.slice(0, nameW).padEnd(nameW),
       bar(total(c) / top),
       fmt(total(c)).padStart(6),
@@ -364,31 +375,47 @@ export function summaryText(): string {
   const [chatty, chattyC] = best((c) => c.outputTokens)
   const [crasher, crasherC] = best((c) => c.errors)
   const [slow, slowC] = best((c) => (c.requests ? c.totalLatencyMs / c.requests : 0))
-  const awards = [
-    `🗣️ **Tagarela**: ${chatty} (${fmt(chattyC.outputTokens)} de saída)`,
-    crasherC.errors ? `💥 **Quebra-tudo**: ${crasher} (${crasherC.errors} erros)` : null,
-    slowC.requests
-      ? `🐢 **Lesma**: ${slow} (${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média)`
-      : null,
+  const awards: NonNullable<DiscordEmbed['fields']> = [
+    { name: '🪶 Corvo Tagarela', value: `${chatty}\n${fmt(chattyC.outputTokens)} gerados`, inline: true },
   ]
-    .filter(Boolean)
-    .join(' · ')
+  if (crasherC.errors) {
+    awards.push({
+      name: '☠️ Casamento Vermelho',
+      value: `${crasher}\n${crasherC.errors} reqs tombadas`,
+      inline: true,
+    })
+  }
+  if (slowC.requests) {
+    awards.push({
+      name: '❄️ Lento como o Inverno',
+      value: `${slow}\n${(slowC.totalLatencyMs / slowC.requests / 1000).toFixed(1)}s de média`,
+      inline: true,
+    })
+  }
 
-  return cache(
-    [
-      `👑 **CC Gateway — Trono dos Tokens** · desde ${sinceStr}`,
+  return cache({
+    description: [
+      `👑 **${rows[0][0]}**, ${KING_TITLE} — **${fmt(top)}** tokens queimados.`,
       '```',
       ...board,
       '```',
-      `🏦 **${fmt(grand)} tokens** em ${tReq} reqs` +
-        (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
-        ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
-      awards,
-      // Legenda em subtexto (`-#` = texto pequeno no Discord).
-      '-# 📖 barra = consumo em relação ao líder · tokens = entrada + cache + saída · % = fatia do total · 💥 = requisições com erro',
-      '-# 🗣️ Tagarela = mais tokens gerados · 💥 Quebra-tudo = mais erros · 🐢 Lesma = maior latência média · placar zera a cada janela de 7 dias',
     ].join('\n'),
-  )
+    fields: [
+      {
+        name: '🏰 O reino inteiro',
+        value:
+          `**${fmt(grand)} tokens** em ${tReq} reqs` +
+          (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
+          ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
+      },
+      ...awards,
+    ],
+    footer: {
+      text:
+        `desde ${sinceStr} · o Inverno chega a cada 7 dias e zera o reino\n` +
+        'barra = consumo em relação ao líder · tokens = entrada + cache + saída · % = fatia do total · 💥 = reqs com erro',
+    },
+  })
 }
 
 /**
@@ -398,7 +425,7 @@ export function summaryText(): string {
  */
 export async function postReport(): Promise<void> {
   if (!webhookUrl) return
-  await sendDiscord(webhookUrl, summaryText())
+  await sendDiscord(webhookUrl, { embeds: [summaryEmbed()] })
   log('info', 'usage-meter: posted per-user report to Discord')
 }
 

@@ -17,6 +17,12 @@ const BAND_STEP = 5
 // A downward move of at least this many points means the window rolled over.
 const RESET_DROP = 20
 
+// Cores dos brasões (tema Game of Tokens).
+const GREEN = 0x2ecc71
+const ORANGE = 0xe67e22
+const RED = 0xe74c3c
+const BLUE = 0x3498db
+
 const H_7D_UTIL = 'anthropic-ratelimit-unified-7d-utilization'
 const H_7D_STATUS = 'anthropic-ratelimit-unified-7d-status'
 const H_7D_RESET = 'anthropic-ratelimit-unified-7d-reset'
@@ -113,14 +119,21 @@ export function maybeNotifyUsage(
     saveState(util)
     resetCounters() // re-baseline per-user metering to the new 7-day window
     if (webhookUrl) {
-      void sendDiscord(
-        webhookUrl,
-        [
-          `🔄 **Uso do CC Gateway zerado** — a janela de 7 dias virou. Placar novo, todo mundo volta pro zero.`,
-          `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
-          '-# 📖 a janela de 7 dias é da conta compartilhada; o Trono dos Tokens recomeça junto',
-        ].join('\n'),
-      )
+      void sendDiscord(webhookUrl, {
+        embeds: [
+          {
+            title: '🔄 A Longa Noite passou — o Trono de Ferro está vazio',
+            description:
+              'A janela de 7 dias virou. Placar zerado, que comecem os jogos.\n' +
+              `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
+            color: BLUE,
+            footer: {
+              text: 'a janela de 7 dias é da conta compartilhada; o Game of Tokens recomeça junto',
+            },
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      })
     }
     return
   }
@@ -137,20 +150,35 @@ export function maybeNotifyUsage(
   const resetStr = resetRaw
     ? new Date(Number(resetRaw) * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
     : 'unknown'
-  const emoji = band >= 90 ? '🚨' : band >= 75 ? '⚠️' : '📊'
+  const color = band >= 90 ? RED : band >= 75 ? ORANGE : GREEN
+  const herald =
+    band >= 90
+      ? `🚨 A Muralha está caindo — o reino já queimou ${band}%`
+      : band >= 75
+        ? `⚠️ Caminhantes Brancos avistados — ${band}% do reino queimado`
+        : `📜 Os corvos anunciam: ${band}% do reino queimado`
 
-  const lines = [
-    `${emoji} **Uso do CC Gateway passou de ${band}%**`,
-    `\`7d ${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%** (\`${status}\`)`,
-    fiveH !== undefined
-      ? `\`5h ${bar(Number(fiveH), 20)}\` ${(Number(fiveH) * 100).toFixed(1)}%`
-      : null,
-    `⏳ janela de 7 dias reinicia em ${resetStr}`,
-    '-# 📖 7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · quem gastou o quê sai no 👑 Trono dos Tokens',
-  ].filter(Boolean)
+  const embed = {
+    title: herald,
+    description: [
+      `\`7d ${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
+      fiveH !== undefined ? `\`5h ${bar(Number(fiveH), 20)}\` ${(Number(fiveH) * 100).toFixed(1)}%` : null,
+    ]
+      .filter(Boolean)
+      .join('\n'),
+    color,
+    fields: [
+      { name: 'status', value: `\`${status}\``, inline: true },
+      { name: '❄️ o Inverno (reset de 7d) chega em', value: resetStr, inline: true },
+    ],
+    footer: {
+      text: '7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · quem queimou o quê sai no ⚔️ Game of Tokens',
+    },
+    timestamp: new Date().toISOString(),
+  }
 
   if (webhookUrl) {
-    void sendDiscord(webhookUrl, lines.join('\n'))
+    void sendDiscord(webhookUrl, { embeds: [embed] })
     log('info', `usage-notify: sent Discord alert (band ${band}%)`)
   }
 }
