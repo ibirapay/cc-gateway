@@ -344,7 +344,7 @@ export function initBilling(config: Config): void {
 
   billingConfig = config.billing
   statePath = resolve(process.cwd(), 'billing-state.json')
-  webhookUrl = `http://173.212.213.180:8443/_billing/webhook`
+  webhookUrl = `https://ccg.pagcoin.org/_billing/webhook`
   discordWebhook = config.notify?.discord_webhook ?? ''
   clientNames = config.auth.tokens.map((t) => t.name)
 
