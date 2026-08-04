@@ -307,7 +307,32 @@ function shouldGenerate(): boolean {
   return Date.now() - new Date(state.lastGenerated).getTime() >= 30 * DAY_MS
 }
 
+
+function remindPending(): void {
+  if (!discordWebhook) return
+  const exempt = new Set(billingConfig.exempt ?? [])
+  const pending = state.invoices.filter(
+    (i) => i.status === "pending" && !exempt.has(i.clientName),
+  )
+  if (!pending.length) return
+
+  const lines = pending.map((i) => {
+    const due = new Date(i.dueAt)
+    const daysLeft = Math.max(0, Math.ceil((due.getTime() - Date.now()) / 86_400_000))
+    return `\u2022 **${i.clientName}** \u2014 R$${i.amountBrl} \u2014 ${daysLeft}d restante(s) \u2014 [Pagar](${i.checkoutUrl})`
+  })
+
+  sendDiscord(discordWebhook, {
+    embeds: [{
+      title: "\u23f0 Lembrete de pagamento",
+      description: lines.join("\n"),
+      color: 0xe67e22,
+    }],
+  })
+}
+
 function dailyCheck(): void {
+  remindPending()
   markOverdue()
   if (shouldGenerate()) {
     log('info', 'billing: 30 days elapsed, generating new invoices')
