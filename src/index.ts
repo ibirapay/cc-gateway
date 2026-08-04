@@ -6,6 +6,7 @@ import { reloadProxyAgent } from './proxy-agent.js'
 import { initUsageNotify } from './usage-notify.js'
 import { initUsageMeter, postReport } from './usage-meter.js'
 import { initConversationLog } from './conversation-log.js'
+import { initBilling, generateInvoices } from './billing.js'
 
 const configPath = process.argv[2]
 
@@ -46,6 +47,15 @@ try {
   initUsageMeter({
     webhook: config.notify?.discord_webhook,
     reportIntervalHours: config.notify?.usage_report_interval_hours,
+  })
+
+  // Billing: MP invoicing + enforcement.
+  initBilling(config)
+
+  // `kill -USR2 <pid>` triggers manual invoice generation.
+  process.on('SIGUSR2', () => {
+    log('info', 'SIGUSR2 received — generating invoices manually')
+    void generateInvoices()
   })
 
   // `kill -USR1 <pid>` posts the per-user report to Discord immediately —

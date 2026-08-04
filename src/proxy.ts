@@ -14,6 +14,7 @@ import { attachUsage, recordRequest, recordMetrics } from './usage-meter.js'
 import { logRequestStart, logResponseAttach, logRequestError } from './conversation-log.js'
 import { initRateLimiter, checkRateLimit, logRateLimitHit } from './rate-limiter.js'
 import { isOpen, recordSuccess, recordFailure } from './circuit-breaker.js'
+import { isBlocked, handleWebhook } from './billing.js'
 
 // Headers that must NOT be forwarded upstream: hop-by-hop framing headers and
 // the client's own auth (the gateway injects the real OAuth token below).
@@ -159,6 +160,27 @@ async function handleRequest(
     return
   }
 
+  // Billing webhook — no auth (MP cannot send client tokens)
+  if (path === '/_billing/webhook' && method === 'POST') {
+    handleWebhook(req, res)
+    return
+  }
+
+  // Billing report (admin, auth required handled below)
+  if (path === '/_billing/generate' && method === 'POST') {
+    const clientName = authenticate(req)
+    if (!clientName) {
+      res.writeHead(401, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Unauthorized' }))
+      return
+    }
+    const { generateInvoices } = await import('./billing.js')
+    await generateInvoices()
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ status: 'invoices_generated' }))
+    return
+  }
+
   // Authenticate client (proxy-level auth)
   const clientName = authenticate(req)
   if (!clientName) {
@@ -169,6 +191,14 @@ async function handleRequest(
   }
 
   log('info', `[${requestId}] Client "${clientName}" → ${method} ${path}`)
+
+  // Billing enforcement — block overdue clients
+  if (isBlocked(clientName)) {
+    res.writeHead(402, { 'Content-Type': 'application/json', 'x-request-id': requestId })
+    res.end(JSON.stringify({ error: 'Payment required — invoice overdue' }))
+    log('warn', `[${requestId}] Client "${clientName}" blocked (overdue invoice)`)
+    return
+  }
 
   // OAuth swap endpoint — authenticated client can replace the refresh token
   if (path === '/_oauth' && method === 'POST') {

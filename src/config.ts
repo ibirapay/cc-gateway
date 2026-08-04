@@ -73,6 +73,15 @@ export type Config = {
     dir?: string              // default: ./conversation-history
     retention_days?: number   // default: 365
   }
+  // Billing: Mercado Pago monthly invoicing per client.
+  billing?: {
+    enabled?: boolean
+    mp_access_token: string
+    mp_webhook_secret?: string
+    amount_brl: number
+    grace_days: number
+    exempt?: string[]
+  }
 }
 
 function validateConfig(config: Config): void {
@@ -140,6 +149,20 @@ function validateConfig(config: Config): void {
       }
     } catch (err) {
       throw new Error(`config: notify.discord_webhook is not a valid Discord webhook URL: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+
+  // Billing validation (optional but validate if enabled)
+  if (config.billing?.enabled) {
+    if (!config.billing.mp_access_token) {
+      throw new Error('config: billing.mp_access_token is required when billing is enabled')
+    }
+    if (!config.billing.amount_brl || config.billing.amount_brl <= 0) {
+      throw new Error('config: billing.amount_brl must be > 0')
+    }
+    if (!config.billing.grace_days || config.billing.grace_days < 1) {
+      throw new Error('config: billing.grace_days must be >= 1')
     }
   }
 
