@@ -109,23 +109,79 @@ function maybeAlertContext(name: string, c: Counters, ctx: number): void {
 
 // Preço equivalente de API, em US$ por milhão de tokens (a conta do gateway é
 // assinatura, não pay-per-token — isto é "quanto custaria via API").
-// Cache: escrita 1.25× a entrada (TTL 5min), leitura 0.1×.
-const PRICES: Record<string, { in: number; out: number }> = {
-  'claude-fable': { in: 10, out: 50 },
-  'claude-mythos': { in: 10, out: 50 },
-  'claude-opus': { in: 5, out: 25 },
-  'claude-sonnet': { in: 3, out: 15 },
-  'claude-haiku': { in: 1, out: 5 },
+// Fonte: platform.claude.com/docs/en/about-claude/pricing, conferida 2026-10-18
+// contra o `costUSD` que o próprio Claude Code calcula (tests/pricing.test.ts).
+// `read` = multiplicador do cache lido sobre `in`: muda por modelo (0.1× padrão,
+// 0.05× Opus/Sonnet 5.5, 0.025× Fable/Mythos 5.1). Escrita de cache é igual em
+// todo modelo: 1.25× com TTL 5min, 2× com TTL 1h.
+// ⚠️ Ordem importa: o primeiro prefixo que casa vence, então o mais específico
+// vem antes ('claude-opus-5-5' antes de 'claude-opus-5').
+type Price = {
+  in: number
+  out: number
+  read: number
+  fast?: { in: number; out: number } // usage.speed === 'fast'
+  over100k?: { in: number; out: number } // prompt (in + cache) > 100k tokens
 }
-const CACHE_WRITE_MULT = 1.25
-const CACHE_READ_MULT = 0.1
+const PRICES: [string, Price][] = [
+  ['claude-fable-5-1', { in: 10, out: 50, read: 0.025 }],
+  ['claude-mythos-5-1', { in: 10, out: 50, read: 0.025 }],
+  ['claude-fable-5', { in: 10, out: 50, read: 0.1 }],
+  ['claude-mythos-5', { in: 10, out: 50, read: 0.1 }],
+  ['claude-opus-5-5', { in: 4, out: 20, read: 0.05, fast: { in: 8, out: 40 } }],
+  ['claude-opus-5', { in: 5, out: 25, read: 0.1, fast: { in: 10, out: 50 } }],
+  ['claude-opus-4-8', { in: 5, out: 25, read: 0.1, fast: { in: 10, out: 50 } }],
+  ['claude-opus-4-7', { in: 5, out: 25, read: 0.1 }],
+  ['claude-opus-4-6', { in: 5, out: 25, read: 0.1 }],
+  ['claude-opus-4-5', { in: 5, out: 25, read: 0.1 }],
+  ['claude-opus-4', { in: 15, out: 75, read: 0.1 }], // 4 e 4.1
+  ['claude-sonnet-5-5', { in: 2, out: 10, read: 0.05 }],
+  ['claude-sonnet-5', { in: 2, out: 10, read: 0.1 }],
+  ['claude-sonnet-4', { in: 3, out: 15, read: 0.1 }], // 4, 4.5, 4.6
+  ['claude-haiku-5-5', { in: 0.1, out: 0.5, read: 0.1, over100k: { in: 0.5, out: 2.5 } }],
+  ['claude-haiku-4-5', { in: 1, out: 5, read: 0.1 }],
+]
+const CACHE_WRITE_5M_MULT = 1.25
+const CACHE_WRITE_1H_MULT = 2
 
 /** Preço do modelo, ou null se ele não estiver na tabela — nunca chuta valor. */
-function priceOf(model: string): { in: number; out: number } | null {
-  for (const [prefix, p] of Object.entries(PRICES)) {
+function priceOf(model: string): Price | null {
+  for (const [prefix, p] of PRICES) {
     if (model.startsWith(prefix)) return p
   }
   return null
+}
+
+/**
+ * Custo em US$ de UMA resposta, ou null se o modelo não tem preço.
+ * ponytail: ignora inference_geo "us" (1.1×) e server tools (web search) —
+ * o Claude Code via gateway manda geo global e não usa web search pago aqui.
+ */
+export function costOf(acc: {
+  model?: string
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreate: number
+  cacheCreate1h: number
+  speed?: string
+}): number | null {
+  const p = acc.model ? priceOf(acc.model) : null
+  if (!p) return null
+  const prompt = acc.input + acc.cacheRead + acc.cacheCreate
+  const base =
+    acc.speed === 'fast' && p.fast ? p.fast : prompt > 100_000 && p.over100k ? p.over100k : p
+  // Sem o detalhamento por TTL, a escrita conta como 5min — o padrão da API.
+  const w1h = Math.min(acc.cacheCreate1h, acc.cacheCreate)
+  const w5m = acc.cacheCreate - w1h
+  return (
+    (acc.input * base.in +
+      w5m * base.in * CACHE_WRITE_5M_MULT +
+      w1h * base.in * CACHE_WRITE_1H_MULT +
+      acc.cacheRead * base.in * p.read +
+      acc.output * base.out) /
+    1_000_000
+  )
 }
 
 const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
@@ -228,6 +284,9 @@ type UsageLike = {
   output_tokens?: number
   cache_read_input_tokens?: number
   cache_creation_input_tokens?: number
+  // Mesma escrita, separada por TTL — a de 1h custa 2× a entrada, a de 5min 1.25×.
+  cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+  speed?: string
 }
 
 type Acc = {
@@ -235,6 +294,8 @@ type Acc = {
   output: number
   cacheRead: number
   cacheCreate: number
+  cacheCreate1h: number
+  speed?: string
   // Modelo que de fato atendeu (vem do próprio stream) e ferramentas chamadas.
   model?: string
   tools: Record<string, number>
@@ -247,6 +308,9 @@ function applyUsage(acc: Acc, u?: UsageLike): void {
   if (typeof u.output_tokens === 'number') acc.output = u.output_tokens
   if (typeof u.cache_read_input_tokens === 'number') acc.cacheRead = u.cache_read_input_tokens
   if (typeof u.cache_creation_input_tokens === 'number') acc.cacheCreate = u.cache_creation_input_tokens
+  if (typeof u.cache_creation?.ephemeral_1h_input_tokens === 'number')
+    acc.cacheCreate1h = u.cache_creation.ephemeral_1h_input_tokens
+  if (typeof u.speed === 'string') acc.speed = u.speed
 }
 
 function parseSSE(data: string, acc: Acc, clientDebug?: string): void {
@@ -298,7 +362,7 @@ function parseSSE(data: string, acc: Acc, clientDebug?: string): void {
 export function attachUsage(client: string, res: IncomingMessage, status?: number): void {
   const ct = String(res.headers['content-type'] || '')
   const isSSE = ct.includes('event-stream')
-  const acc: Acc = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, tools: {} }
+  const acc: Acc = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0, tools: {} }
   let tail = ''
   let jsonBuf = ''
   const MAX_JSON = 2_000_000
@@ -365,14 +429,9 @@ export function attachUsage(client: string, res: IncomingMessage, status?: numbe
       for (const [name, n] of Object.entries(acc.tools)) c.tools[name] = (c.tools[name] || 0) + n
       if (acc.model) {
         c.models[acc.model] = (c.models[acc.model] || 0) + 1
-        const p = priceOf(acc.model)
-        if (p) {
-          c.costUsd +=
-            (acc.input * p.in +
-              acc.cacheCreate * p.in * CACHE_WRITE_MULT +
-              acc.cacheRead * p.in * CACHE_READ_MULT +
-              acc.output * p.out) /
-            1_000_000
+        const usd = costOf(acc)
+        if (usd !== null) {
+          c.costUsd += usd
         } else {
           // Sem preço conhecido: conta o furo em vez de inventar um valor.
           c.unpricedReqs++
@@ -455,7 +514,7 @@ function fmtPer(n: number | null): string {
 }
 
 // Custo por chamada. Vale mais que tok/chamada pra "quem queima a cota": o
-// costUsd já aplica os multiplicadores (cache escrito 1.25×, cache lido 0.1×),
+// costUsd já aplica os multiplicadores de cache por modelo e TTL (ver costOf),
 // então 1M de tokens relidos de cache NÃO pesa o mesmo que 1M de tokens novos.
 function usdPer(c: Counters): string {
   const u = per(c.costUsd, c)
