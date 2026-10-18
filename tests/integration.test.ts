@@ -100,12 +100,12 @@ try {
     pass('2.4', 'Token length validation', 'Found minimum token length check (16 chars)')
   }
 
-  // Check Discord webhook validation
+  // Check TeamSpeak notify-target validation
   const webhookValidation =
-    configCode.includes('url.hostname.includes(\'discord\')') &&
-    configCode.includes('url.pathname.includes(\'/webhooks/\')')
+    configCode.includes('config.notify?.teamspeak') &&
+    configCode.includes('must be <ts3audiobot-api>/<bot-name>')
   if (webhookValidation) {
-    pass('2.5', 'Discord webhook validation', 'Found Discord webhook URL checks')
+    pass('2.5', 'TeamSpeak notify-target validation', 'Found TeamSpeak notify-target checks')
   }
 } catch (err) {
   fail('2', 'Config Validation', String(err))
@@ -347,8 +347,8 @@ try {
 
   // Check validation in config
   const configValidation =
-    configCode.includes('url.hostname.includes(\'discord\')') &&
-    configCode.includes('url.pathname.includes(\'/webhooks/\')')
+    configCode.includes('config.notify?.teamspeak') &&
+    configCode.includes('must be <ts3audiobot-api>/<bot-name>')
   if (configValidation) {
     pass(
       '9.1',
@@ -359,8 +359,8 @@ try {
 
   // Check validation in usage-notify
   const notifyValidation =
-    usageNotifyCode.includes('url.hostname.includes(\'discord\')') &&
-    usageNotifyCode.includes('url.pathname.includes(\'/webhooks/\')')
+    usageNotifyCode.includes('Invalid TeamSpeak notify target') &&
+    usageNotifyCode.includes('URL path must be the TS3AudioBot bot name')
   if (notifyValidation) {
     pass(
       '9.2',

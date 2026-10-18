@@ -300,6 +300,16 @@ async function handleRequest(
         }
       })
 
+      // Log upstream error bodies so we know WHY Anthropic rejected a request.
+      if (status === 401 || status === 403) {
+        const errChunks: Buffer[] = []
+        proxyRes.on('data', (c: Buffer) => errChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+        proxyRes.on('end', () => {
+          const body = Buffer.concat(errChunks).toString('utf8').slice(0, 500)
+          log('warn', `[${requestId}] upstream ${status} for ${clientName}: ${body}`)
+        })
+      }
+
       // Stream response directly (SSE for Claude responses)
       proxyRes.pipe(res)
 

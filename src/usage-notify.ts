@@ -17,21 +17,32 @@ const BAND_STEP = 5
 // A downward move of at least this many points means the window rolled over.
 const RESET_DROP = 20
 
-// Cores dos brasões (tema Game of Tokens).
 const GREEN = 0x2ecc71
 const ORANGE = 0xe67e22
 const RED = 0xe74c3c
 const BLUE = 0x3498db
+
+const TZ_OFFSET = -3
+
+function toBRT(iso: string): string {
+  const d = new Date(iso)
+  d.setUTCHours(d.getUTCHours() + TZ_OFFSET)
+  return d.toISOString().replace('T', ' ').slice(0, 16) + ' BRT'
+}
 
 const H_7D_UTIL = 'anthropic-ratelimit-unified-7d-utilization'
 const H_7D_STATUS = 'anthropic-ratelimit-unified-7d-status'
 const H_7D_RESET = 'anthropic-ratelimit-unified-7d-reset'
 const H_5H_UTIL = 'anthropic-ratelimit-unified-5h-utilization'
 
+const WARN_BEFORE_MS = 5 * 60 * 1000
+
 let webhookUrl: string | null = null
 let statePath: string | null = null
 // Highest band we've already notified for. Initialize to 0 to avoid spurious notifications for 0% utilization.
 let lastBand = 0
+// Reset epoch (seconds) we already sent the 5-min warning for.
+let warnedResetEpoch = 0
 
 type State = { band: number; util: number; ts: string }
 
@@ -112,23 +123,48 @@ export function maybeNotifyUsage(
   const pct = Math.max(0, Math.min(100, util * 100))
   const band = Math.floor(pct / BAND_STEP) * BAND_STEP // 0,5,10,…,100
 
+  // 5-minute warning before window reset — fires once per reset epoch.
+  const resetRawEarly = header(headers, H_7D_RESET)
+  if (resetRawEarly) {
+    const resetEpoch = Number(resetRawEarly)
+    const resetMs = resetEpoch * 1000
+    const remaining = resetMs - Date.now()
+    if (remaining > 0 && remaining <= WARN_BEFORE_MS && warnedResetEpoch !== resetEpoch) {
+      warnedResetEpoch = resetEpoch
+      const mins = Math.ceil(remaining / 60_000)
+      void sendDiscord(webhookUrl!, {
+        embeds: [{
+          title: '⏰ Janela de 7 dias reseta em ~' + mins + ' min',
+          description:
+            'Finalize conversas abertas — o uso acumulado zera em breve.\n' +
+            `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%** usado nesta janela`,
+          color: ORANGE,
+          footer: { text: 'aviso automático · 5 min antes do reset' },
+          timestamp: new Date().toISOString(),
+        }],
+      })
+      log('info', `usage-notify: sent 5-min reset warning (resets at ${new Date(resetMs).toISOString()})`)
+    }
+  }
+
   // Rolling-window reset: a big drop means the window rolled over. Re-arm so
   // future climbs notify again, and send a reset note.
   if (band <= lastBand - RESET_DROP) {
     lastBand = band
+    warnedResetEpoch = 0
     saveState(util)
     resetCounters() // re-baseline per-user metering to the new 7-day window
     if (webhookUrl) {
       void sendDiscord(webhookUrl, {
         embeds: [
           {
-            title: '🔄 Nova era no reino — o trono está vazio',
+            title: '🔄 Nova janela de 7 dias',
             description:
-              'A janela de 7 dias virou. Placar zerado, que comecem os jogos.\n' +
+              'Janela de 7 dias reiniciada. Contadores zerados.\n' +
               `\`${bar(pct / 100, 20)}\` **${pct.toFixed(1)}%**`,
             color: BLUE,
             footer: {
-              text: 'a janela de 7 dias é da conta compartilhada; o placar recomeça junto',
+              text: 'janela de 7 dias da conta compartilhada',
             },
             timestamp: new Date().toISOString(),
           },
@@ -148,15 +184,15 @@ export function maybeNotifyUsage(
   const fiveH = header(headers, H_5H_UTIL)
   const resetRaw = header(headers, H_7D_RESET)
   const resetStr = resetRaw
-    ? new Date(Number(resetRaw) * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
+    ? toBRT(new Date(Number(resetRaw) * 1000).toISOString())
     : 'unknown'
   const color = band >= 90 ? RED : band >= 75 ? ORANGE : GREEN
   const herald =
     band >= 90
-      ? `🚨 O castelo está caindo — o reino já queimou ${band}%`
+      ? `🚨 Uso alto — ${band}% consumido`
       : band >= 75
-        ? `⚠️ Cerco ao castelo — ${band}% do reino queimado`
-        : `📜 Os corvos anunciam: ${band}% do reino queimado`
+        ? `⚠️ Atenção — ${band}% consumido`
+        : `📊 Uso — ${band}% consumido`
 
   const embed = {
     title: herald,
@@ -169,10 +205,10 @@ export function maybeNotifyUsage(
     color,
     fields: [
       { name: 'status', value: `\`${status}\``, inline: true },
-      { name: '⏳ o reino zera em', value: resetStr, inline: true },
+      { name: '⏳ janela reseta em', value: resetStr, inline: true },
     ],
     footer: {
-      text: '7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · quem queimou o quê sai no ⚔️ Game of Tokens',
+      text: '7d/5h = uso da conta compartilhada nas janelas de 7 dias e 5 horas · detalhes no relatório de uso',
     },
     timestamp: new Date().toISOString(),
   }

@@ -39,6 +39,9 @@ type Counters = {
   unpricedReqs: number
   // Largest single-request context (input + cache) seen
   maxInputTokens: number
+  // Maior banda de contexto já alertada neste cliente (0 = nenhuma). Só sobe,
+  // pra não repetir o alerta enquanto o cliente ficar parado na mesma banda.
+  ctxBandAlerted: number
 }
 
 const emptyCounters = (): Counters => ({
@@ -61,7 +64,48 @@ const emptyCounters = (): Counters => ({
   costUsd: 0,
   unpricedReqs: 0,
   maxInputTokens: 0,
+  ctxBandAlerted: 0,
 })
+
+// Alerta de contexto por request. O custo de uma conversa cresce com o QUADRADO
+// dos turnos, porque todo turno reenvia o histórico inteiro — medido em 192
+// sessões: uma de 2747 turnos custou 1,85B tokens de entrada, e a mesma conversa
+// reiniciada a cada 300 turnos custaria 205M.
+//
+// O gateway não vê sessão (a API é stateless, não há session_id na request), mas
+// vê o SINTOMA com exatidão: o tamanho do contexto desta request. Ele não pode
+// consertar — recusar não divide a sessão, entijola ela — então isto avisa e não
+// bloqueia. O remédio (/clear) só existe do lado do cliente.
+const CTX_BANDS = [500_000, 700_000, 900_000]
+const CTX_RED = 900_000
+
+/** Avisa quando UMA request cruza uma banda de contexto nova. Nunca bloqueia. */
+function maybeAlertContext(name: string, c: Counters, ctx: number): void {
+  if (!webhookUrl) return
+  // Maior banda cruzada; só alerta se for acima da última já alertada, senão um
+  // cliente parado em 900k dispararia o alerta em toda request.
+  let band = 0
+  for (const b of CTX_BANDS) if (ctx >= b) band = b
+  if (!band || band <= c.ctxBandAlerted) return
+  c.ctxBandAlerted = band
+  dirty = true
+  void sendDiscord(webhookUrl, {
+    embeds: [
+      {
+        title: band >= CTX_RED ? '🚨 Contexto quase na janela' : '📈 Contexto grande numa request',
+        description:
+          `**${name}** mandou uma request de **${fmt(ctx)} tokens** de entrada.\n` +
+          'Todo turno reenvia o histórico inteiro, então o custo cresce com o ' +
+          '**quadrado dos turnos**. Se for tarefa nova, `/clear` antes do próximo ' +
+          'pedido; se for o mesmo trabalho, ignore.',
+        color: band >= CTX_RED ? 0xe74c3c : 0xe67e22,
+        footer: { text: `banda de ${fmt(band)} · o gateway avisa, não bloqueia` },
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  })
+  log('info', `usage-meter: alerted ${name} at context band ${band}`)
+}
 
 // Preço equivalente de API, em US$ por milhão de tokens (a conta do gateway é
 // assinatura, não pay-per-token — isto é "quanto custaria via API").
@@ -87,7 +131,30 @@ function priceOf(model: string): { in: number; out: number } | null {
 const allIn = (c: Counters) => c.inputTokens + c.cacheReadTokens + c.cacheCreationTokens
 const total = (c: Counters) => allIn(c) + c.outputTokens
 
-// Foto do placar na virada da janela de 7 dias, pra comparar temporadas.
+// Tokens por chamada. Separa "faço mais chamadas" de "cada chamada minha é mais
+// pesada" — sem isso o total sozinho não diz qual dos dois é o consumo alto.
+// Derivado dos contadores que já existem: nada novo pra persistir.
+//
+// ⚠️ O denominador NÃO é `c.requests`. Aquilo conta toda request proxiada,
+// inclusive /v1/messages/count_tokens — que o Claude Code chama direto e que
+// responde sem bloco `usage`. Cada uma soma +1 chamada e 0 token, então dividir
+// por `requests` faz quem chama mais count_tokens parecer MAIS leve por chamada.
+// `models` só é incrementado quando a resposta trouxe um modelo, o que só
+// acontece em inferência de verdade — é esse o denominador honesto.
+const inferenceReqs = (c: Counters) => Object.values(c.models || {}).reduce((s, n) => s + n, 0)
+
+/** Média por chamada, ou null quando não há inferência medida (nunca chuta). */
+const per = (n: number, c: Counters) => {
+  const reqs = inferenceReqs(c)
+  return reqs ? n / reqs : null
+}
+const perReq = (c: Counters) => per(total(c), c)
+
+// Média com pouquíssimas chamadas é ruído — um cliente com 1 request levaria o
+// destaque de "mais pesado". Abaixo disso ele não concorre.
+const MIN_REQS_FOR_RATE = 20
+
+// Snapshot na virada da janela de 7 dias, pra comparar com a anterior.
 type Snapshot = { until: string; clients: Record<string, number> }
 let previous: Snapshot | null = null
 
@@ -98,9 +165,11 @@ let webhookUrl: string | null = null
 let dirty = false
 
 // Embed caching with TTL (30 seconds)
-let cachedSummary: DiscordEmbed | null = null
-let cachedSummaryTime = 0
+let cachedEmbeds: DiscordEmbed[] | null = null
+let cachedEmbedsTime = 0
 const SUMMARY_CACHE_TTL_MS = 30_000
+
+const ACCENT = 0x3498db
 
 function get(name: string): Counters {
   let c = clients.get(name)
@@ -173,10 +242,11 @@ type Acc = {
 
 function applyUsage(acc: Acc, u?: UsageLike): void {
   if (!u) return
-  if (typeof u.input_tokens === 'number') acc.input += u.input_tokens
-  if (typeof u.output_tokens === 'number') acc.output += u.output_tokens
-  if (typeof u.cache_read_input_tokens === 'number') acc.cacheRead += u.cache_read_input_tokens
-  if (typeof u.cache_creation_input_tokens === 'number') acc.cacheCreate += u.cache_creation_input_tokens
+  // Assign, not add — message_delta carries authoritative totals that supersede message_start.
+  if (typeof u.input_tokens === 'number') acc.input = u.input_tokens
+  if (typeof u.output_tokens === 'number') acc.output = u.output_tokens
+  if (typeof u.cache_read_input_tokens === 'number') acc.cacheRead = u.cache_read_input_tokens
+  if (typeof u.cache_creation_input_tokens === 'number') acc.cacheCreate = u.cache_creation_input_tokens
 }
 
 function parseSSE(data: string, acc: Acc, clientDebug?: string): void {
@@ -289,7 +359,9 @@ export function attachUsage(client: string, res: IncomingMessage, status?: numbe
       c.outputTokens += acc.output
       c.cacheReadTokens += acc.cacheRead
       c.cacheCreationTokens += acc.cacheCreate
-      c.maxInputTokens = Math.max(c.maxInputTokens, acc.input + acc.cacheRead + acc.cacheCreate)
+      const ctx = acc.input + acc.cacheRead + acc.cacheCreate
+      c.maxInputTokens = Math.max(c.maxInputTokens, ctx)
+      maybeAlertContext(client, c, ctx)
       for (const [name, n] of Object.entries(acc.tools)) c.tools[name] = (c.tools[name] || 0) + n
       if (acc.model) {
         c.models[acc.model] = (c.models[acc.model] || 0) + 1
@@ -346,7 +418,7 @@ function persist(): void {
     }
     writeFileSync(statePath, JSON.stringify(obj, null, 2), { mode: 0o600 })
     dirty = false
-    cachedSummary = null // Invalidate cache when state changes
+    cachedEmbeds = null
   } catch (err) {
     log('warn', `usage-meter: persist failed: ${err}`)
   }
@@ -374,7 +446,21 @@ function fmt(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
-  return String(n)
+  return String(Math.round(n))
+}
+
+/** Média por chamada; `—` quando não há inferência medida — nunca inventa 0. */
+function fmtPer(n: number | null): string {
+  return n === null ? '—' : fmt(n)
+}
+
+// Custo por chamada. Vale mais que tok/chamada pra "quem queima a cota": o
+// costUsd já aplica os multiplicadores (cache escrito 1.25×, cache lido 0.1×),
+// então 1M de tokens relidos de cache NÃO pesa o mesmo que 1M de tokens novos.
+function usdPer(c: Counters): string {
+  const u = per(c.costUsd, c)
+  if (u === null || !c.costUsd) return 'US$ —'
+  return `US$ ${u < 0.01 ? u.toFixed(4) : u.toFixed(3)}`
 }
 
 // Eighth-block partials so short bars still show something.
@@ -393,19 +479,20 @@ export function bar(frac: number, width = 18): string {
   return ('█'.repeat(full) + (rest ? EIGHTHS[rest - 1] : '')).padEnd(width, '·')
 }
 
-// Dourado do trono.
-const GOLD = 0xf1c40f
-
 const SPARK = '▁▂▃▄▅▆▇█'
-// Fuso do reino: America/Sao_Paulo (sem horário de verão desde 2019).
 const TZ_OFFSET = -3
+
+function toBRT(iso: string): string {
+  const d = new Date(iso)
+  d.setUTCHours(d.getUTCHours() + TZ_OFFSET)
+  return d.toISOString().replace('T', ' ').slice(0, 16) + ' BRT'
+}
 
 /** Buckets UTC → buckets locais, index 0 = 00h local. */
 function toLocalHours(utc: number[]): number[] {
   return Array.from({ length: 24 }, (_, h) => utc[(h - TZ_OFFSET + 24) % 24] || 0)
 }
 
-/** Sparkline de 24 caracteres — monospace, precisa ir dentro de crase. */
 function sparkline(buckets: number[]): string {
   const max = Math.max(...buckets, 1)
   return buckets.map((n) => (n ? SPARK[Math.min(7, Math.floor((n / max) * 7.999))] : '·')).join('')
@@ -430,41 +517,137 @@ function topN(counts: Record<string, number>, n: number): [string, number][] {
     .slice(0, n)
 }
 
-// Tema medieval: coroa pro trono, insígnias pra corte, enxada pro resto.
-const RANK = ['👑', '🗡️', '🛡️', '🏹']
-const PEASANT = '🌾'
+// Agrupa por família (claude-opus-4-8 → opus); ninguém quer ler o id inteiro.
+const family = (m: string) => m.replace(/^claude-/, '').split('-')[0]
+
+function modelSummary(models: Record<string, number>): string {
+  const modelReqs = Object.values(models).reduce((s, n) => s + n, 0)
+  if (!modelReqs) return ''
+  const byFamily: Record<string, number> = {}
+  for (const [m, n] of Object.entries(models)) byFamily[family(m)] = (byFamily[family(m)] || 0) + n
+  return topN(byFamily, 4)
+    .map(([f, n]) => `${f} ${((n / modelReqs) * 100).toFixed(0)}%`)
+    .join(' · ')
+}
+
+/** Per-user detail embed. */
+function userEmbed(name: string, c: Counters, rank: number): DiscordEmbed {
+  const localHours = toLocalHours(c.hours || new Array(24).fill(0))
+  const peak = localHours.indexOf(Math.max(...localHours))
+  const avgLatency = c.requests ? (c.totalLatencyMs / c.requests / 1000).toFixed(1) : '—'
+  const cacheRate = allIn(c) ? ((c.cacheReadTokens / allIn(c)) * 100).toFixed(0) : '0'
+
+  const fields: NonNullable<DiscordEmbed['fields']> = []
+
+  // Tokens
+  fields.push({
+    name: '🔢 Tokens',
+    value: [
+      `**${fmt(total(c))}** total (${fmt(c.requests)} reqs, ${fmt(inferenceReqs(c))} de inferência)`,
+      `⚖️ por chamada: **${fmtPer(perReq(c))}** tok · ${usdPer(c)}`,
+      `   ↳ entrada nova ${fmtPer(per(c.inputTokens, c))} · cache lido ${fmtPer(per(c.cacheReadTokens, c))} · saída ${fmtPer(per(c.outputTokens, c))}`,
+      `📥 entrada: ${fmt(c.inputTokens)} · 📤 saída: ${fmt(c.outputTokens)}`,
+      `📖 cache lido: ${fmt(c.cacheReadTokens)} · ✏️ cache criado: ${fmt(c.cacheCreationTokens)}`,
+      `🧠 ${cacheRate}% cache · 📚 maior contexto: ${fmt(c.maxInputTokens)}`,
+    ].join('\n'),
+  })
+
+  // Models
+  const ml = modelSummary(c.models)
+  if (ml) {
+    fields.push({ name: '🤖 Modelos', value: ml, inline: true })
+  }
+
+  // Cost
+  if (c.costUsd > 0) {
+    fields.push({
+      name: '💰 Custo equivalente',
+      value: `US$ ${c.costUsd.toFixed(2)}` + (c.unpricedReqs ? ` (${c.unpricedReqs} sem preço)` : ''),
+      inline: true,
+    })
+  }
+
+  // Latency
+  if (c.requests) {
+    fields.push({
+      name: '⏱️ Latência',
+      value: `média ${avgLatency}s · mín ${dur(c.minLatencyMs === Number.MAX_VALUE ? 0 : c.minLatencyMs)} · máx ${dur(c.maxLatencyMs)}`,
+      inline: true,
+    })
+  }
+
+  // Time on Claude Code
+  if (c.totalLatencyMs) {
+    fields.push({
+      name: '⏱️ Tempo de Claude Code',
+      value: hrs(c.totalLatencyMs),
+      inline: true,
+    })
+  }
+
+  // Errors
+  if (c.errors) {
+    fields.push({
+      name: '💥 Erros',
+      value: `${c.errors} total · ${c.errors4xx}×4xx ${c.errors5xx}×5xx`,
+      inline: true,
+    })
+  }
+
+  // Activity sparkline
+  if (localHours.some(Boolean)) {
+    fields.push({
+      name: '📊 Atividade por hora (BRT -03)',
+      value: `\`00h ${sparkline(localHours)} 23h\`\npico às ${String(peak).padStart(2, '0')}h`,
+    })
+  }
+
+  // Top tools
+  const tl = topN(c.tools, 5)
+  if (tl.length) {
+    fields.push({
+      name: '🔧 Ferramentas mais usadas',
+      value: tl.map(([t, n]) => `${t} ${fmt(n)}`).join(' · '),
+    })
+  }
+
+  return {
+    title: `${rank}. ${name}`,
+    color: ACCENT,
+    fields,
+  }
+}
 
 /**
- * Build the per-user usage leaderboard as a Discord embed: a ranked bar chart of
- * token burn (crown for the top spender) plus joke awards, all derived from the
- * existing counters. The board goes in a code block — Discord's proportional
- * font would otherwise shred the alignment.
- * Results are cached for 30 seconds to avoid recalculation on frequent calls.
- * @returns Discord embed with per-client and total usage
+ * Build the group summary embed + per-user embeds.
  */
 export function summaryEmbed(): DiscordEmbed {
+  const embeds = allEmbeds()
+  return embeds[0]
+}
+
+function allEmbeds(): DiscordEmbed[] {
   const now = Date.now()
-  // Return cached summary if still fresh
-  if (cachedSummary && now - cachedSummaryTime < SUMMARY_CACHE_TTL_MS) {
-    return cachedSummary
+  if (cachedEmbeds && now - cachedEmbedsTime < SUMMARY_CACHE_TTL_MS) {
+    return cachedEmbeds
   }
 
   const rows = [...clients.entries()].sort((a, b) => total(b[1]) - total(a[1]))
-  const sinceStr = since.slice(0, 16).replace('T', ' ') + ' UTC'
-  const cache = (e: DiscordEmbed): DiscordEmbed => {
-    cachedSummary = {
-      ...e,
-      title: '⚔️ Game of Tokens',
-      color: GOLD,
-      timestamp: new Date(now).toISOString(),
-    }
-    cachedSummaryTime = now
-    return cachedSummary
+  const sinceStr = toBRT(since)
+
+  const cache = (embeds: DiscordEmbed[]): DiscordEmbed[] => {
+    cachedEmbeds = embeds
+    cachedEmbedsTime = now
+    return cachedEmbeds
   }
+
   if (!rows.length) {
-    return cache({
-      description: `O trono está vazio: nenhum lorde queimou um token desde ${sinceStr}. Suspeito.`,
-    })
+    return cache([{
+      title: '📊 Relatório de uso',
+      description: `Nenhum uso registrado desde ${sinceStr}.`,
+      color: ACCENT,
+      timestamp: new Date(now).toISOString(),
+    }])
   }
 
   const sum = (f: (c: Counters) => number) => rows.reduce((s, [, c]) => s + f(c), 0)
@@ -472,82 +655,95 @@ export function summaryEmbed(): DiscordEmbed {
   const top = total(rows[0][1]) || 1
   const nameW = Math.max(...rows.map(([n]) => Math.min(12, n.length)))
   const tReq = sum((c) => c.requests)
+  const tInf = sum(inferenceReqs)
   const tErr4xx = sum((c) => c.errors4xx)
   const tErr5xx = sum((c) => c.errors5xx)
 
   const board = rows.map(([name, c], i) =>
     [
-      RANK[i] || PEASANT,
+      `${i + 1}.`,
       name.slice(0, nameW).padEnd(nameW),
-      bar(total(c) / top),
+      // Barra encolhida de 18 pra 12: abre espaço pra coluna nova sem alongar a
+      // linha, que quebra feio no code block do Discord mobile.
+      bar(total(c) / top, 12),
       fmt(total(c)).padStart(6),
       `${((total(c) / (grand || 1)) * 100).toFixed(0).padStart(3)}%`,
+      fmtPer(perReq(c)).padStart(6),
       c.errors ? `💥${c.errors}` : '',
     ]
       .join(' ')
       .trimEnd(),
   )
 
-  // Joke awards — same counters, no extra bookkeeping.
+  // Destaques — mesmos contadores, sem bookkeeping extra.
   const best = (score: (c: Counters) => number) =>
     rows.reduce((a, b) => (score(b[1]) > score(a[1]) ? b : a))
   const [chatty, chattyC] = best((c) => c.outputTokens)
   const [crasher, crasherC] = best((c) => c.errors)
   const [slow, slowC] = best((c) => c.maxLatencyMs)
-  const awards: NonNullable<DiscordEmbed['fields']> = []
+  const highlights: NonNullable<DiscordEmbed['fields']> = []
   if (chattyC.outputTokens) {
-    awards.push({
+    highlights.push({
       name: '📤 Mais tokens gerados',
       value: `${chatty}\n${fmt(chattyC.outputTokens)} tokens`,
       inline: true,
     })
   }
   if (crasherC.errors) {
-    awards.push({
+    highlights.push({
       name: '💥 Mais erros',
       value: `${crasher}\n${crasherC.errors} reqs`,
       inline: true,
     })
   }
   if (slowC.maxLatencyMs) {
-    awards.push({
-      name: '⏳ Requisição mais demorada',
+    highlights.push({
+      name: '⏳ Requisição mais lenta',
       value: `${slow}\n${dur(slowC.maxLatencyMs)}`,
       inline: true,
     })
   }
 
-  // Custo por cliente: diverge do placar de tokens quando os modelos diferem.
   const [priciest, priciestC] = best((c) => c.costUsd)
   if (priciestC.costUsd > 0) {
-    awards.push({
+    highlights.push({
       name: '💸 Mais caro',
       value: `${priciest}\nUS$ ${priciestC.costUsd.toFixed(2)}`,
       inline: true,
     })
   }
 
-  // Contexto: maior requisição única já vista no reino.
-  const [ctxLord, ctxLordC] = best((c) => c.maxInputTokens)
-  if (ctxLordC.maxInputTokens) {
-    awards.push({
+  const [ctxUser, ctxUserC] = best((c) => c.maxInputTokens)
+  if (ctxUserC.maxInputTokens) {
+    highlights.push({
       name: '📚 Maior contexto',
-      value: `${ctxLord}\n${fmt(ctxLordC.maxInputTokens)} tokens`,
+      value: `${ctxUser}\n${fmt(ctxUserC.maxInputTokens)} tokens`,
       inline: true,
     })
   }
 
-  // Horas de Claude Code: latência somada = tempo de modelo rodando pra esse lorde.
+  // Não dá pra reusar best(): ele varre TODAS as linhas, e uma média sobre
+  // poucas chamadas é ruído — quem fez 1 request levaria o destaque.
+  const rated = rows.filter(([, c]) => inferenceReqs(c) >= MIN_REQS_FOR_RATE)
+  if (rated.length) {
+    const [heavy, heavyC] = rated.reduce((a, b) => ((perReq(b[1]) ?? 0) > (perReq(a[1]) ?? 0) ? b : a))
+    highlights.push({
+      name: '⚖️ Mais pesado por chamada',
+      value: `${heavy}\n${fmtPer(perReq(heavyC))} tok · ${usdPer(heavyC)}`,
+      inline: true,
+    })
+  }
+
   const [busiest, busiestC] = best((c) => c.totalLatencyMs)
   if (busiestC.totalLatencyMs) {
-    awards.push({
-      name: '🕯️ Mais horas de Claude Code',
+    highlights.push({
+      name: '⏱️ Mais tempo de Claude Code',
       value: `${busiest}\n${hrs(busiestC.totalLatencyMs)}`,
       inline: true,
     })
   }
 
-  // Temporada anterior: variação por lorde e do reino (só existe após o 1º reset).
+  // Janela anterior: variação por usuário.
   const pct = (now: number, before: number) => ((now - before) / before) * 100
   const arrow = (d: number) => `${d >= 0 ? '▲' : '▼'}${Math.abs(d).toFixed(0)}%`
   const deltaLine = previous
@@ -562,7 +758,7 @@ export function summaryEmbed(): DiscordEmbed {
     ? Object.values(previous.clients).reduce((a, b) => a + b, 0)
     : 0
 
-  // Agregados do reino: custo, modelos, ferramentas, ritmo por hora.
+  // Agregados globais: custo, modelos, ferramentas, ritmo por hora.
   const merge = (pick: (c: Counters) => Record<string, number>) => {
     const out: Record<string, number> = {}
     for (const [, c] of rows) {
@@ -570,92 +766,101 @@ export function summaryEmbed(): DiscordEmbed {
     }
     return out
   }
-  // Agrupa por família (claude-opus-4-8 → opus); ninguém quer ler o id inteiro.
-  const family = (m: string) => m.replace(/^claude-/, '').split('-')[0]
   const models = merge((c) => c.models)
-  const modelReqs = Object.values(models).reduce((s, n) => s + n, 0)
-  const byFamily: Record<string, number> = {}
-  for (const [m, n] of Object.entries(models)) byFamily[family(m)] = (byFamily[family(m)] || 0) + n
-  const modelLine = topN(byFamily, 4)
-    .map(([f, n]) => `${f} ${((n / (modelReqs || 1)) * 100).toFixed(0)}%`)
-    .join(' · ')
+  const modelLine = modelSummary(models)
 
   const tools = merge((c) => c.tools)
   const toolLine = topN(tools, 5)
     .map(([t, n]) => `${t} ${fmt(n)}`)
     .join(' · ')
 
-  const kingdomIn = sum(allIn)
+  const totalIn = sum(allIn)
   const cost = sum((c) => c.costUsd)
   const unpriced = sum((c) => c.unpricedReqs)
-  const kingdomHours = toLocalHours(
+  const globalHours = toLocalHours(
     Array.from({ length: 24 }, (_, h) => sum((c) => c.hours?.[h] || 0)),
   )
-  const peak = kingdomHours.indexOf(Math.max(...kingdomHours))
+  const peak = globalHours.indexOf(Math.max(...globalHours))
 
-  return cache({
+  const groupEmbed: DiscordEmbed = {
+    title: '📊 Relatório de uso',
+    color: ACCENT,
+    timestamp: new Date(now).toISOString(),
     description: [
-      `👑 **${rows[0][0]}** reina com **${fmt(top)}** tokens queimados.`,
+      `**${rows[0][0]}** lidera com **${fmt(top)}** tokens.`,
       '```',
       ...board,
       '```',
     ].join('\n'),
     fields: [
       {
-        name: '🏰 O reino inteiro',
+        name: '📊 Total geral',
         value: [
           `**${fmt(grand)} tokens** em ${tReq} reqs` +
             (tErr4xx + tErr5xx ? ` · ${tErr4xx}×4xx ${tErr5xx}×5xx` : '') +
-            ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s de média`,
+            ` · ${(sum((c) => c.totalLatencyMs) / (tReq || 1) / 1000).toFixed(1)}s média`,
+          tInf
+            ? `⚖️ **${fmt(grand / tInf)}** tokens por chamada · ${tInf} chamadas de inferência` +
+              ` (${tReq - tInf} sem tokens, ex. count_tokens)`
+            : null,
           [
             cost || unpriced
               ? `💰 US$ ${cost.toFixed(2)}` + (unpriced ? ` (${unpriced} reqs sem preço)` : '')
               : null,
-            // Média do reino, ponderada por token — não é a média das médias.
-            kingdomIn ? `🧠 ${((sum((c) => c.cacheReadTokens) / kingdomIn) * 100).toFixed(0)}% de cache` : null,
+            totalIn ? `🧠 ${((sum((c) => c.cacheReadTokens) / totalIn) * 100).toFixed(0)}% cache` : null,
           ]
             .filter(Boolean)
             .join(' · ') || null,
-          [`🕯️ ${hrs(sum((c) => c.totalLatencyMs))} de Claude Code`, modelLine ? `🤖 ${modelLine}` : null]
+          [`⏱️ ${hrs(sum((c) => c.totalLatencyMs))} de Claude Code`, modelLine ? `🤖 ${modelLine}` : null]
             .filter(Boolean)
             .join(' · '),
-          prevGrand ? `📈 ${arrow(pct(grand, prevGrand))} vs a janela anterior` : null,
+          prevGrand ? `📈 ${arrow(pct(grand, prevGrand))} vs. janela anterior` : null,
         ]
           .filter(Boolean)
           .join('\n'),
       },
-      // Só aparecem quando já há dado — placar recém-zerado não mostra campo vazio.
-      ...(kingdomHours.some(Boolean)
+      ...(globalHours.some(Boolean)
         ? [
             {
-              name: '🕰️ Ritmo do reino (hora local)',
-              value: `\`00h ${sparkline(kingdomHours)} 23h\`\npico às ${String(peak).padStart(2, '0')}h`,
+              name: '📊 Atividade por hora (BRT -03)',
+              value: `\`00h ${sparkline(globalHours)} 23h\`\npico às ${String(peak).padStart(2, '0')}h`,
             },
           ]
         : []),
-      ...(toolLine ? [{ name: '🔧 Ferramentas mais empunhadas', value: toolLine }] : []),
+      ...(toolLine ? [{ name: '🔧 Ferramentas mais usadas', value: toolLine }] : []),
       ...(deltaLine
         ? [
             {
-              name: `📈 Contra a janela anterior (até ${previous!.until.slice(5, 10).split('-').reverse().join('/')})`,
+              name: `📈 vs. janela anterior (até ${previous!.until.slice(5, 10).split('-').reverse().join('/')})`,
               value: deltaLine,
             },
           ]
         : []),
-      ...awards,
+      ...highlights,
     ],
-    footer: { text: `desde ${sinceStr}` },
-  })
+    // Legenda no rodapé em vez de cabeçalho dentro do code block: alinhar
+    // cabeçalho com padEnd é frágil e quebra assim que um nome muda de tamanho.
+    footer: { text: `desde ${sinceStr} · colunas: total · % · tokens por chamada` },
+  }
+
+  // Per-user detail embeds
+  const userEmbeds = rows.map(([name, c], i) => userEmbed(name, c, i + 1))
+
+  return cache([groupEmbed, ...userEmbeds])
 }
 
 /**
  * Post the usage summary to Discord via webhook.
  * Called by scheduled interval or on-demand (SIGUSR1 signal).
- * @throws Never throws; failures are logged and silently ignored
+ * Discord allows max 10 embeds per message.
  */
 export async function postReport(): Promise<void> {
   if (!webhookUrl) return
-  await sendDiscord(webhookUrl, { embeds: [summaryEmbed()] })
+  const embeds = allEmbeds()
+  // Discord limit: 10 embeds per message
+  for (let i = 0; i < embeds.length; i += 10) {
+    await sendDiscord(webhookUrl, { embeds: embeds.slice(i, i + 10) })
+  }
   log('info', 'usage-meter: posted per-user report to Discord')
 }
 

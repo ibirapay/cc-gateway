@@ -143,6 +143,7 @@ function validateConfig(config: Config): void {
     }
   }
 
+
   // Logging validation
   if (config.logging?.level && !['debug', 'info', 'warn', 'error'].includes(config.logging.level)) {
     throw new Error(`config: logging.level must be one of: debug, info, warn, error (got ${config.logging.level})`)
