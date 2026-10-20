@@ -2,7 +2,8 @@
 """ccg-panel -- tiny web GUI for CC Gateway OAuth control.
 
 Env: CCG_CLIENT_TOKEN (required, any client token from config.yaml), CCG_GATEWAY,
-CCG_BIND (default 127.0.0.1), CCG_PORT (default 9480). Self-check: ccg-panel --selftest
+CCG_BIND (default 127.0.0.1), CCG_PORT (default 9480), CCG_ENV_FILE (default ~/.config/ccg-panel.env,
+rewritten when the panel rotates its own token). Self-check: ccg-panel --selftest
 """
 import base64, hashlib, json, os, secrets, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -16,6 +17,7 @@ CLIENT_TOKEN = os.environ.get("CCG_CLIENT_TOKEN", "")
 LOCAL_CREDS = Path.home() / ".claude" / ".credentials.json"
 BIND = os.environ.get("CCG_BIND", "127.0.0.1")
 PORT = int(os.environ.get("CCG_PORT", "9480"))
+ENV_FILE = Path(os.environ.get("CCG_ENV_FILE", str(Path.home() / ".config" / "ccg-panel.env")))
 
 # Mirrors Claude Code 2.1.304 (loginWithClaudeAi + manual redirect)
 AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
@@ -78,7 +80,16 @@ HTML = """<!DOCTYPE html>
   .msg.info { display:block; background:#0d1d30; border:1px solid var(--blue); color:var(--blue); }
   .clients { display:flex; flex-wrap:wrap; gap:.35rem; margin-top:.25rem; }
   .chip { background:var(--bg); border:1px solid var(--border); border-radius:4px;
-          padding:.15rem .45rem; font-size:.75rem; color:var(--muted); }
+          padding:.15rem .45rem; font-size:.75rem; color:var(--muted); cursor:pointer; }
+  .chip:hover { border-color:var(--blue); color:var(--text); }
+  button.danger { background:#da3633; border-color:#da3633; }
+  button.danger:hover { background:#f85149; }
+  #client-actions { display:none; margin-top:.75rem; padding:.75rem; border:1px solid var(--border);
+                    border-radius:6px; font-size:.85rem; }
+  #rotate-result { display:none; margin-top:.75rem; padding:.75rem; border:1px solid var(--blue);
+                   border-radius:6px; background:#0d1d30; font-size:.85rem; }
+  #rotate-result .row { display:flex; gap:.5rem; margin:.5rem 0; }
+  #rotate-result input { flex:1; }
   .hint { font-size:.8rem; color:var(--muted); margin-top:.5rem; }
   #login-step2 { display:none; margin-top:.75rem; }
   #login-step2 .code-row { display:flex; gap:.5rem; margin-top:.5rem; }
@@ -95,6 +106,23 @@ HTML = """<!DOCTYPE html>
     <div class="status-row"><span class="label">OAuth</span><span class="val" id="s-oauth">...</span></div>
     <div class="status-row"><span class="label">Upstream</span><span class="val" id="s-upstream">...</span></div>
     <div class="status-row"><span class="label">Clients</span><div class="clients" id="s-clients"></div></div>
+    <p class="hint">Click a client to rotate or invalidate its token.</p>
+    <div id="client-actions">
+      <div>Client <b id="a-name"></b></div>
+      <div class="actions">
+        <button class="blue" onclick="rotate(true)">Rotate (old token works 24h)</button>
+        <button class="danger" onclick="rotate(false)">Leaked: rotate + kill old now</button>
+        <button onclick="endGrace()">End grace now</button>
+        <button onclick="document.getElementById('client-actions').style.display='none'">Cancel</button>
+      </div>
+    </div>
+    <div id="rotate-result">
+      <div>New token for <b id="r-name"></b> (shown once):</div>
+      <div class="row"><input type="text" id="r-token" readonly><button onclick="copyToken()">Copy</button></div>
+      <div class="hint" id="r-grace"></div>
+      <div class="actions"><button class="primary" id="r-download" onclick="downloadLauncher()">Download launcher</button>
+        <button onclick="document.getElementById('rotate-result').style.display='none'">Close</button></div>
+    </div>
   </div>
 
   <div class="section">
@@ -134,7 +162,7 @@ async function loadStatus() {
     setText('s-oauth', d.oauth || '-', ok ? 'ok' : 'bad');
     setText('s-upstream', d.upstream || '-', '');
     document.getElementById('s-clients').innerHTML =
-      (d.clients||[]).map(c => '<span class="chip">'+esc(c)+'</span>').join('');
+      (d.clients||[]).map(c => '<span class="chip" title="Rotate token" onclick="openClient(this.textContent)">'+esc(c)+'</span>').join('');
   } catch(e) {
     document.getElementById('dot').style.background = 'var(--red)';
     setText('s-status', 'unreachable', 'bad');
@@ -142,6 +170,63 @@ async function loadStatus() {
     setText('s-upstream', '-', 'muted');
     document.getElementById('s-clients').innerHTML = '';
   }
+}
+
+let _launcher = null, _client = null;
+
+function openClient(name) {
+  _client = name;
+  document.getElementById('a-name').textContent = name;
+  document.getElementById('rotate-result').style.display = 'none';
+  document.getElementById('client-actions').style.display = 'block';
+}
+
+async function rotate(grace) {
+  const name = _client;
+  if (grace && !confirm('Rotate the token for ' + name + '?\\n\\nThe old token keeps working for 24 hours, then stops. ' +
+               'Rotating the same client again within 24 hours cuts off its oldest token immediately.')) return;
+  if (!grace && !confirm('Kill every old token of ' + name + ' right now?\\n\\n' + name +
+               "'s machine stops working until the new launcher is installed.")) return;
+  try {
+    const d = await post('/api/rotate', {name, grace});
+    if (d.status !== 'ok') { showMsg(d.error || JSON.stringify(d), 'err'); return; }
+    _launcher = d.launcher;
+    document.getElementById('client-actions').style.display = 'none';
+    document.getElementById('r-name').textContent = d.name;
+    document.getElementById('r-token').value = d.token;
+    document.getElementById('r-grace').textContent =
+      (d.previous_valid_until ? 'Old token works until ' + new Date(d.previous_valid_until).toLocaleString() + '. '
+                              : 'Old token was invalidated now. ') +
+      (d.launcher ? 'Install the new launcher on ' + d.name + "'s machine before then (run it with: install)."
+                  : 'No launcher on the server: send the token to ' + d.name + ' manually.') +
+      (d.self ? " This was the panel's own token: it already switched to the new one." : '');
+    document.getElementById('r-download').style.display = d.launcher ? '' : 'none';
+    document.getElementById('rotate-result').style.display = 'block';
+    showMsg('Rotated ' + d.name + '.', 'ok');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+}
+async function endGrace() {
+  const name = _client;
+  if (!confirm('Kill the old token of ' + name + ' now, without waiting for the 24h grace period?')) return;
+  try {
+    const d = await post('/api/end-grace', {name});
+    if (d.status !== 'ok') { showMsg(d.error || JSON.stringify(d), 'err'); return; }
+    document.getElementById('client-actions').style.display = 'none';
+    showMsg('Old token of ' + name + ' invalidated. Only the newest token works now.', 'ok');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+}
+function copyToken() {
+  const el = document.getElementById('r-token');
+  el.select();
+  document.execCommand('copy');
+}
+function downloadLauncher() {
+  if (!_launcher) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([_launcher.content], {type: 'text/x-shellscript'}));
+  a.download = _launcher.filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 async function startLogin() {
@@ -274,7 +359,21 @@ def exchange_code(code: str, verifier: str, state: str) -> dict:
 
 
 def gateway_swap(refresh_token: str) -> tuple[int, dict]:
-    req = Request(f"{GATEWAY}/_oauth", data=json.dumps({"refresh_token": refresh_token}).encode(), method="POST")
+    return gateway_post("/_oauth", {"refresh_token": refresh_token})
+
+
+def gateway_rotate(name: str, grace: bool) -> tuple[int, dict]:
+    global CLIENT_TOKEN
+    code, data = gateway_post("/_admin/rotate", {"name": name, "grace": grace})
+    if code == 200 and data.get("self"):
+        CLIENT_TOKEN = data["token"]
+        if ENV_FILE.exists():
+            ENV_FILE.write_text(f"CCG_CLIENT_TOKEN={CLIENT_TOKEN}\n")
+    return code, data
+
+
+def gateway_post(path: str, payload: dict) -> tuple[int, dict]:
+    req = Request(f"{GATEWAY}{path}", data=json.dumps(payload).encode(), method="POST")
     req.add_header("x-api-key", CLIENT_TOKEN)
     req.add_header("Content-Type", "application/json")
     try:
@@ -310,6 +409,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/swap":
             self._json(*gateway_swap(body.get("refresh_token", "")))
+        elif self.path == "/api/rotate":
+            self._json(*gateway_rotate(body.get("name", ""), body.get("grace") is not False))
+        elif self.path == "/api/end-grace":
+            self._json(*gateway_post("/_admin/end-grace", {"name": body.get("name", "")}))
         elif self.path == "/api/login-finish":
             self._login_finish(body.get("code", ""))
         else:
@@ -371,6 +474,14 @@ def selftest():
     q = parse_qs(urlparse(url).query)
     assert url.startswith(AUTHORIZE_URL) and len(q["state"][0]) == 43 and len(_pkce["verifier"]) == 43
     assert q["code_challenge"][0] == b64url(hashlib.sha256(_pkce["verifier"].encode()).digest())
+    import shutil, subprocess, tempfile
+    if shutil.which("node"):
+        js = HTML.split("<script>")[1].split("</script>")[0]
+        with tempfile.NamedTemporaryFile("w", suffix=".js") as f:
+            f.write(js)
+            f.flush()
+            r = subprocess.run(["node", "--check", f.name], capture_output=True, text=True)
+        assert r.returncode == 0, "panel JS does not parse:\n" + r.stderr
     print("selftest ok")
 
 

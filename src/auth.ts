@@ -1,43 +1,48 @@
 import type { IncomingMessage } from 'http'
 import type { Config, TokenEntry } from './config.js'
 
-const tokenMap = new Map<string, TokenEntry>()
+type Slot = { entry: TokenEntry; expiresAt?: number }
+
+const tokenMap = new Map<string, Slot>()
 
 /**
- * Initialize the authentication system with configured client tokens.
- * Builds an in-memory lookup map for fast token validation on each request.
- * @param config - Gateway configuration containing auth.tokens array
+ * Build the in-memory token lookup. A rotated client's previous token is
+ * registered too, until its grace period (previous_expires_at) ends.
  */
 export function initAuth(config: Config) {
   tokenMap.clear()
   for (const entry of config.auth.tokens) {
-    tokenMap.set(entry.token, entry)
+    tokenMap.set(entry.token, { entry })
+    if (entry.previous_token && (entry.previous_expires_at ?? 0) > Date.now()) {
+      tokenMap.set(entry.previous_token, { entry, expiresAt: entry.previous_expires_at })
+    }
   }
 }
 
+function lookup(token: string): TokenEntry | null {
+  const slot = tokenMap.get(token)
+  if (!slot) return null
+  if (slot.expiresAt !== undefined && Date.now() >= slot.expiresAt) return null
+  return slot.entry
+}
+
 /**
- * Authenticate incoming request by API key or Bearer token.
- * Supports both x-api-key header and Bearer token in Authorization/Proxy-Authorization headers.
- * Returns the token entry name (for audit logging) or null if unauthorized.
- * @param req - Incoming HTTP request
- * @returns Client name if authenticated, null otherwise
+ * Authenticate by x-api-key, or a Bearer token in Authorization/Proxy-Authorization.
+ * Returns the client name (for audit logging) or null if unauthorized.
  */
 export function authenticate(req: IncomingMessage): string | null {
-  // CC with ANTHROPIC_API_KEY sends x-api-key header
   const apiKey = req.headers['x-api-key']
   if (apiKey && typeof apiKey === 'string') {
-    const entry = tokenMap.get(apiKey)
+    const entry = lookup(apiKey)
     if (entry) return entry.name
   }
-
-  // Fallback: Bearer token in Authorization or Proxy-Authorization (case-insensitive)
   const authHeader = req.headers['proxy-authorization'] || req.headers['authorization']
   if (!authHeader || typeof authHeader !== 'string') return null
-
-  // Match Bearer token with case-insensitive prefix (handles Bearer, bearer, BEARER)
   const match = authHeader.match(/^bearer\s+(.+)$/i)
   if (!match) return null
+  return lookup(match[1])?.name ?? null
+}
 
-  const entry = tokenMap.get(match[1])
-  return entry?.name ?? null
+export function isAdmin(config: Config, name: string): boolean {
+  return config.auth.tokens.some((t) => t.name === name && t.admin === true)
 }
