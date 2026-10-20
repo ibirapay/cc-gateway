@@ -110,6 +110,11 @@ HTML = """<!DOCTYPE html>
   .chip { background:var(--bg); border:1px solid var(--border); border-radius:4px;
           padding:.15rem .45rem; font-size:.75rem; color:var(--muted); cursor:pointer; }
   .chip:hover { border-color:var(--blue); color:var(--text); }
+  .chip.add { border-style:dashed; color:var(--blue); }
+  #add-client { display:none; margin-top:.75rem; padding:.75rem; border:1px solid var(--border);
+                border-radius:6px; font-size:.85rem; }
+  #add-client .row { display:flex; gap:.5rem; margin-top:.5rem; }
+  #add-client input { flex:1; }
   button.danger { background:#da3633; border-color:#da3633; }
   button.danger:hover { background:#f85149; }
   #client-actions { display:none; margin-top:.75rem; padding:.75rem; border:1px solid var(--border);
@@ -134,7 +139,13 @@ HTML = """<!DOCTYPE html>
     <div class="status-row"><span class="label">OAuth</span><span class="val" id="s-oauth">...</span></div>
     <div class="status-row"><span class="label">Upstream</span><span class="val" id="s-upstream">...</span></div>
     <div class="status-row"><span class="label">Clients</span><div class="clients" id="s-clients"></div></div>
-    <p class="hint">Click a client to rotate or invalidate its token.</p>
+    <p class="hint">Click a client to rotate or invalidate its token, or + Add for a new machine.</p>
+    <div id="add-client">
+      <div>New client name (lowercase letters, digits, - or _):</div>
+      <div class="row"><input type="text" id="add-name" placeholder="e.g. laptop-joao" maxlength="32">
+        <button class="primary" onclick="addClient()">Add</button>
+        <button onclick="document.getElementById('add-client').style.display='none'">Cancel</button></div>
+    </div>
     <div id="client-actions">
       <div>Client <b id="a-name"></b></div>
       <div class="actions">
@@ -145,7 +156,7 @@ HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div id="rotate-result">
-      <div>New token for <b id="r-name"></b> (shown once):</div>
+      <div><span id="r-title">New token for</span> <b id="r-name"></b> (shown once):</div>
       <div class="row"><input type="text" id="r-token" readonly><button onclick="copyToken()">Copy</button></div>
       <div class="hint" id="r-grace"></div>
       <div class="actions"><button class="primary" id="r-download" onclick="downloadLauncher()">Download launcher</button>
@@ -190,7 +201,8 @@ async function loadStatus() {
     setText('s-oauth', d.oauth || '-', ok ? 'ok' : 'bad');
     setText('s-upstream', d.upstream || '-', '');
     document.getElementById('s-clients').innerHTML =
-      (d.clients||[]).map(c => '<span class="chip" title="Rotate token" onclick="openClient(this.textContent)">'+esc(c)+'</span>').join('');
+      (d.clients||[]).map(c => '<span class="chip" title="Rotate token" onclick="openClient(this.textContent)">'+esc(c)+'</span>').join('') +
+      '<span class="chip add" title="Add a new client" onclick="openAdd()">+ Add</span>';
   } catch(e) {
     document.getElementById('dot').style.background = 'var(--red)';
     setText('s-status', 'unreachable', 'bad');
@@ -218,19 +230,47 @@ async function rotate(grace) {
   try {
     const d = await post('/api/rotate', {name, grace});
     if (d.status !== 'ok') { showMsg(d.error || JSON.stringify(d), 'err'); return; }
-    _launcher = d.launcher;
-    document.getElementById('client-actions').style.display = 'none';
-    document.getElementById('r-name').textContent = d.name;
-    document.getElementById('r-token').value = d.token;
-    document.getElementById('r-grace').textContent =
+    showResult(d, 'New token for',
       (d.previous_valid_until ? 'Old token works until ' + new Date(d.previous_valid_until).toLocaleString() + '. '
                               : 'Old token was invalidated now. ') +
       (d.launcher ? 'Install the new launcher on ' + d.name + "'s machine before then (run it with: install)."
                   : 'No launcher on the server: send the token to ' + d.name + ' manually.') +
-      (d.self ? " This was the panel's own token: it already switched to the new one." : '');
-    document.getElementById('r-download').style.display = d.launcher ? '' : 'none';
-    document.getElementById('rotate-result').style.display = 'block';
+      (d.self ? " This was the panel's own token: it already switched to the new one." : ''));
     showMsg('Rotated ' + d.name + '.', 'ok');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+}
+
+function showResult(d, title, note) {
+  _launcher = d.launcher;
+  document.getElementById('client-actions').style.display = 'none';
+  document.getElementById('add-client').style.display = 'none';
+  document.getElementById('r-title').textContent = title;
+  document.getElementById('r-name').textContent = d.name;
+  document.getElementById('r-token').value = d.token;
+  document.getElementById('r-grace').textContent = note;
+  document.getElementById('r-download').style.display = d.launcher ? '' : 'none';
+  document.getElementById('rotate-result').style.display = 'block';
+}
+
+function openAdd() {
+  document.getElementById('client-actions').style.display = 'none';
+  document.getElementById('rotate-result').style.display = 'none';
+  document.getElementById('add-client').style.display = 'block';
+  document.getElementById('add-name').value = '';
+  document.getElementById('add-name').focus();
+}
+
+async function addClient() {
+  const name = document.getElementById('add-name').value.trim();
+  if (!name) { showMsg('Type a name for the new client.', 'err'); return; }
+  try {
+    const d = await post('/api/add-client', {name});
+    if (d.status !== 'ok') { showMsg(d.error || JSON.stringify(d), 'err'); return; }
+    showResult(d, 'New client',
+      d.launcher ? 'Download the launcher and run it on the new machine with: install.'
+                 : 'No launcher template on the server: send this token to the new machine manually.');
+    showMsg('Added ' + d.name + '.', 'ok');
+    loadStatus();
   } catch(e) { showMsg(friendlyErr(e), 'err'); }
 }
 async function endGrace() {
@@ -478,6 +518,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(*gateway_swap(body.get("refresh_token", "")))
         elif self.path == "/api/rotate":
             self._json(*gateway_rotate(body.get("name", ""), body.get("grace") is not False))
+        elif self.path == "/api/add-client":
+            self._json(*gateway_post("/_admin/add-client", {"name": body.get("name", "")}))
         elif self.path == "/api/end-grace":
             self._json(*gateway_post("/_admin/end-grace", {"name": body.get("name", "")}))
         elif self.path == "/api/login-finish":

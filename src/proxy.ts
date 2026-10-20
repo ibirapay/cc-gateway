@@ -6,7 +6,7 @@ import { URL } from 'url'
 import { randomUUID } from 'crypto'
 import type { Config } from './config.js'
 import { authenticate, initAuth, isAdminRequest } from './auth.js'
-import { endGrace, rotateClientToken, RotateError } from './rotate.js'
+import { addClient, endGrace, rotateClientToken, RotateError } from './rotate.js'
 import { resolve } from 'path'
 import { getAccessToken, swapOAuth } from './oauth.js'
 import { audit, log } from './logger.js'
@@ -175,7 +175,7 @@ async function handleRequest(
   log('info', `[${requestId}] Client "${clientName}" → ${method} ${path}`)
 
   // Admin: rotate a client's token (old one valid 24h unless grace=false), or end a grace period now
-  if ((path === '/_admin/rotate' || path === '/_admin/end-grace') && method === 'POST') {
+  if (['/_admin/rotate', '/_admin/end-grace', '/_admin/add-client'].includes(path) && method === 'POST') {
     if (!isAdminRequest(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Admin only' }))
@@ -191,7 +191,11 @@ async function handleRequest(
       const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
       const name = body?.name
       if (!name || typeof name !== 'string') throw new RotateError(400, 'Missing client name')
-      if (path === '/_admin/end-grace') {
+      if (path === '/_admin/add-client') {
+        const r = addClient(config, configPath, name)
+        log('info', `[${requestId}] Client "${clientName}" added client "${name}"`)
+        payload = { status: 'ok', name: r.name, token: r.token, previous_valid_until: null, self: false, added: true, launcher: r.launcher }
+      } else if (path === '/_admin/end-grace') {
         endGrace(config, configPath, name)
         log('info', `[${requestId}] Client "${clientName}" ended the grace period of "${name}"`)
         payload = { status: 'ok', name }

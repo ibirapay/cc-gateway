@@ -12,7 +12,7 @@ import type { AddressInfo } from 'node:net'
 import type { IncomingMessage } from 'node:http'
 import { loadConfig } from '../src/config.js'
 import { authenticate, initAuth } from '../src/auth.js'
-import { endGrace, GRACE_MS, rotateClientToken, RotateError } from '../src/rotate.js'
+import { addClient, endGrace, GRACE_MS, rotateClientToken, RotateError } from '../src/rotate.js'
 import { startProxy } from '../src/proxy.js'
 
 const T = (c: string) => c.repeat(64)
@@ -127,6 +127,29 @@ const req = (key: string) => ({ headers: { 'x-api-key': key } }) as unknown as I
   rmSync(dir, { recursive: true })
 }
 
+// 2c. add a new client (new machine)
+{
+  const { dir, cfgPath, config } = setup()
+  const r = addClient(config, cfgPath, 'newbox')
+  assert.match(r.token, /^[0-9a-f]{64}$/)
+  assert.equal(authenticate(req(r.token)), 'newbox', 'new client works at once')
+  const saved = readFileSync(cfgPath, 'utf-8')
+  assert.ok(saved.includes("# nodge's machine") && saved.includes(`  refresh_token: ${LONG_RT}\n`), 'config format kept')
+  initAuth(loadConfig(cfgPath))
+  assert.equal(authenticate(req(r.token)), 'newbox', 'survives restart')
+  assert.equal(r.launcher?.filename, 'cc-newbox')
+  assert.ok(r.launcher?.content.includes(`CLIENT_TOKEN="${r.token}"`) && r.launcher.content.includes('GATEWAY_URL="https://ccg.example.org"'))
+  assert.equal(readFileSync(join(dir, 'clients', 'cc-newbox'), 'utf-8'), r.launcher?.content, 'launcher saved')
+  assert.equal(authenticate(req(T('b'))), 'nodge', 'existing clients untouched')
+  for (const bad of ['', 'Bad', '../x', 'a b', 'x'.repeat(33)]) {
+    assert.throws(() => addClient(config, cfgPath, bad), (e) => e instanceof RotateError && e.status === 400, bad)
+  }
+  assert.throws(() => addClient(config, cfgPath, 'nodge'), (e) => e instanceof RotateError && e.status === 409)
+  const rot = rotateClientToken(config, cfgPath, 'newbox')
+  assert.equal(loadConfig(cfgPath).auth.tokens.find((t) => t.name === 'newbox')!.token, rot.token, 'added client can be rotated')
+  rmSync(dir, { recursive: true })
+}
+
 // 3. HTTP route: admin-only, returns token + launcher
 {
   const { dir, cfgPath, config } = setup()
@@ -153,6 +176,14 @@ const req = (key: string) => ({ headers: { 'x-api-key': key } }) as unknown as I
   const nogr = await rotate(T('a'), 'nesi', false)
   assert.equal(((await nogr.json()) as { previous_valid_until: unknown }).previous_valid_until, null)
   assert.equal(await verify(T('c')), 401, 'grace=false kills the old token over HTTP')
+
+  const add = (key: string, name: string) =>
+    fetch(`${base}/_admin/add-client`, { method: 'POST', headers: { 'x-api-key': key }, body: JSON.stringify({ name }) })
+  assert.equal((await add(body.token, 'sneaky')).status, 403, 'non-admin (nodge, current token) cannot add clients')
+  const added = (await (await add(T('a'), 'laptop')).json()) as { token: string; added: boolean; launcher: { filename: string } }
+  assert.ok(added.added && added.launcher.filename === 'cc-laptop')
+  assert.equal(await verify(added.token), 200, 'added client accepted over HTTP')
+  assert.equal((await add(T('a'), 'laptop')).status, 409)
 
   // the admin's own token rotated with grace: the old (maybe leaked) one may still proxy, never administer
   const self = (await (await rotate(T('a'), 'admin')).json()) as { token: string; self: boolean }

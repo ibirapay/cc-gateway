@@ -1,7 +1,7 @@
 import { randomBytes } from 'crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs'
 import { dirname, join, resolve } from 'path'
-import { parseDocument } from 'yaml'
+import { isSeq, parseDocument } from 'yaml'
 import type { Config } from './config.js'
 import { initAuth } from './auth.js'
 import { log } from './logger.js'
@@ -89,13 +89,34 @@ export function endGrace(config: Config, configPath: string, name: string): void
   initAuth(config)
 }
 
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
+
+/** Register a new client (new machine) with a fresh token, live without a restart. */
+export function addClient(config: Config, configPath: string, name: string): RotateResult {
+  if (!NAME_RE.test(name)) throw new RotateError(400, 'Name: 1-32 characters, lowercase letters, digits, - or _')
+  if (config.auth.tokens.some((t) => t.name === name)) throw new RotateError(409, `A client named ${name} already exists`)
+  const token = randomBytes(32).toString('hex')
+
+  const doc = parseDocument(readFileSync(configPath, 'utf-8'))
+  const list = doc.getIn(['auth', 'tokens'])
+  if (!isSeq(list) || list.items.length !== config.auth.tokens.length) {
+    throw new RotateError(409, 'config.yaml changed on disk since startup; restart the gateway before changing tokens')
+  }
+  doc.addIn(['auth', 'tokens'], doc.createNode({ name, token }))
+  writeFileSync(configPath, doc.toString({ lineWidth: 0 }))
+
+  config.auth.tokens.push({ name, token })
+  initAuth(config)
+  return { name, token, previousValidUntil: null, launcher: rewriteLauncher(config, configPath, name, null, token) }
+}
+
 const tokenOf = (script: string) => script.match(/^CLIENT_TOKEN="([^"]*)"/m)?.[1]
 
 /**
  * Regenerate the client's launcher script from clients/: the file that holds the
  * old token, or (none found) any cc-* launcher as a template saved as cc-<name>.
  */
-function rewriteLauncher(config: Config, configPath: string, name: string, oldToken: string, token: string) {
+function rewriteLauncher(config: Config, configPath: string, name: string, oldToken: string | null, token: string) {
   const dir = config.clients?.dir ?? join(dirname(resolve(configPath)), 'clients')
   if (!existsSync(dir)) return null
   const scripts = readdirSync(dir)
