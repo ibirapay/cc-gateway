@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""ccg-panel -- tiny web GUI for CC Gateway OAuth control.
+
+Env: CCG_CLIENT_TOKEN (required, any client token from config.yaml), CCG_GATEWAY,
+CCG_BIND (default 127.0.0.1), CCG_PORT (default 9480). Self-check: ccg-panel --selftest
+"""
+import base64, hashlib, json, os, secrets, sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlparse, parse_qs
+from pathlib import Path
+
+GATEWAY = os.environ.get("CCG_GATEWAY", "http://ccg.pagcoin.org:8443")
+CLIENT_TOKEN = os.environ.get("CCG_CLIENT_TOKEN", "")
+LOCAL_CREDS = Path.home() / ".claude" / ".credentials.json"
+BIND = os.environ.get("CCG_BIND", "127.0.0.1")
+PORT = int(os.environ.get("CCG_PORT", "9480"))
+
+# Mirrors Claude Code 2.1.304 (loginWithClaudeAi + manual redirect)
+AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload user:plugins"
+# Python-urllib's UA gets Cloudflare 1010; "claude-code/..." gets a fake 429 rate_limit_error
+UA = "claude-cli/2.1.304 (external, cli)"
+
+# ponytail: one in-flight login at a time, fine for a single-operator panel
+_pkce = None
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CCG Panel</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3;
+          --muted:#8b949e; --green:#3fb950; --red:#f85149; --blue:#58a6ff;
+          --btn:#21262d; --btn-primary:#238636; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+         background:var(--bg); color:var(--text); min-height:100vh;
+         display:flex; align-items:center; justify-content:center; padding:1rem; }
+  .panel { background:var(--card); border:1px solid var(--border); border-radius:12px;
+           padding:2rem; width:100%; max-width:480px; }
+  h1 { font-size:1.25rem; font-weight:600; margin-bottom:1.5rem; display:flex;
+       align-items:center; gap:.5rem; }
+  h1 .dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+  .status-row { display:flex; justify-content:space-between; padding:.6rem 0;
+                border-bottom:1px solid var(--border); font-size:.9rem; }
+  .status-row:last-child { border-bottom:none; }
+  .label { color:var(--muted); }
+  .val { font-weight:500; }
+  .val.ok { color:var(--green); }
+  .val.bad { color:var(--red); }
+  .val.muted { color:var(--muted); }
+  .section { margin-top:1.5rem; }
+  .section h2 { font-size:.85rem; color:var(--muted); text-transform:uppercase;
+                letter-spacing:.05em; margin-bottom:.75rem; }
+  textarea, input[type=text] { width:100%; background:var(--bg); border:1px solid var(--border);
+             border-radius:6px; color:var(--text); padding:.5rem; font-family:monospace; font-size:.8rem; }
+  textarea { resize:vertical; min-height:60px; }
+  .actions { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
+  button { padding:.5rem 1rem; border-radius:6px; border:1px solid var(--border);
+           background:var(--btn); color:var(--text); cursor:pointer; font-size:.85rem;
+           font-weight:500; transition:background .15s; }
+  button:hover { background:#30363d; }
+  button.primary { background:var(--btn-primary); border-color:var(--btn-primary); }
+  button.primary:hover { background:#2ea043; }
+  button.blue { background:#1f6feb; border-color:#1f6feb; }
+  button.blue:hover { background:#388bfd; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .msg { margin-top:.75rem; padding:.5rem .75rem; border-radius:6px; font-size:.85rem; display:none; }
+  .msg.ok { display:block; background:#0d2818; border:1px solid var(--green); color:var(--green); }
+  .msg.err { display:block; background:#2d1117; border:1px solid var(--red); color:var(--red); }
+  .msg.info { display:block; background:#0d1d30; border:1px solid var(--blue); color:var(--blue); }
+  .clients { display:flex; flex-wrap:wrap; gap:.35rem; margin-top:.25rem; }
+  .chip { background:var(--bg); border:1px solid var(--border); border-radius:4px;
+          padding:.15rem .45rem; font-size:.75rem; color:var(--muted); }
+  .hint { font-size:.8rem; color:var(--muted); margin-top:.5rem; }
+  #login-step2 { display:none; margin-top:.75rem; }
+  #login-step2 .code-row { display:flex; gap:.5rem; margin-top:.5rem; }
+  #login-step2 input { flex:1; }
+  .divider { border-top:1px solid var(--border); margin:1rem 0; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1><span class="dot" id="dot"></span> CC Gateway</h1>
+
+  <div>
+    <div class="status-row"><span class="label">Status</span><span class="val" id="s-status">...</span></div>
+    <div class="status-row"><span class="label">OAuth</span><span class="val" id="s-oauth">...</span></div>
+    <div class="status-row"><span class="label">Upstream</span><span class="val" id="s-upstream">...</span></div>
+    <div class="status-row"><span class="label">Clients</span><div class="clients" id="s-clients"></div></div>
+  </div>
+
+  <div class="section">
+    <h2>Login & Swap</h2>
+    <div class="actions">
+      <button class="blue" id="btn-login" onclick="startLogin()">Login with Claude</button>
+      <button id="btn-local" onclick="doSwapLocal()">Use Local Creds</button>
+      <button onclick="loadStatus()">Refresh</button>
+    </div>
+
+    <div id="login-step2">
+      <p class="hint">Paste the code shown on the Claude page (the whole thing, including the part after #):</p>
+      <div class="code-row">
+        <input type="text" id="code-input" placeholder="code#state">
+        <button class="primary" id="btn-finish" onclick="finishLogin()">Swap</button>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+    <details>
+      <summary style="font-size:.8rem;color:var(--muted);cursor:pointer">Manual refresh-token paste</summary>
+      <textarea id="token-input" placeholder="sk-ant-ort01-..." style="margin-top:.5rem"></textarea>
+      <div class="actions"><button class="primary" id="btn-swap" onclick="doSwap()">Swap Token</button></div>
+    </details>
+
+    <div class="msg" id="msg"></div>
+  </div>
+</div>
+
+<script>
+async function loadStatus() {
+  try {
+    const d = await (await fetch('/api/health')).json();
+    const ok = d.oauth === 'valid';
+    document.getElementById('dot').style.background = ok ? 'var(--green)' : 'var(--red)';
+    setText('s-status', d.status || 'error', ok ? 'ok' : 'bad');
+    setText('s-oauth', d.oauth || '-', ok ? 'ok' : 'bad');
+    setText('s-upstream', d.upstream || '-', '');
+    document.getElementById('s-clients').innerHTML =
+      (d.clients||[]).map(c => '<span class="chip">'+esc(c)+'</span>').join('');
+  } catch(e) {
+    document.getElementById('dot').style.background = 'var(--red)';
+    setText('s-status', 'unreachable', 'bad');
+    setText('s-oauth', '-', 'muted');
+    setText('s-upstream', '-', 'muted');
+    document.getElementById('s-clients').innerHTML = '';
+  }
+}
+
+async function startLogin() {
+  const btn = document.getElementById('btn-login');
+  btn.disabled = true;
+  try {
+    const d = await (await fetch('/api/login-start')).json();
+    window.open(d.auth_url, '_blank');
+    document.getElementById('login-step2').style.display = 'block';
+    document.getElementById('code-input').value = '';
+    document.getElementById('code-input').focus();
+    showMsg('Authenticate in the new tab, then paste the code here.', 'info');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+  finally { btn.disabled = false; }
+}
+
+async function finishLogin() {
+  const code = document.getElementById('code-input').value.trim();
+  if (!code) { showMsg('Paste the code first.', 'err'); return; }
+  const btn = document.getElementById('btn-finish');
+  btn.disabled = true;
+  try {
+    const d = await post('/api/login-finish', {code});
+    if (d.status === 'ok') {
+      showMsg('Logged in and swapped! Expires in ' + d.expires_in_minutes + ' min', 'ok');
+      document.getElementById('login-step2').style.display = 'none';
+      loadStatus();
+    } else showMsg(d.error || JSON.stringify(d), 'err');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+  finally { btn.disabled = false; }
+}
+
+async function doSwap() {
+  const token = document.getElementById('token-input').value.trim();
+  if (!token) { showMsg('Paste a refresh token first.', 'err'); return; }
+  await swap(token);
+}
+
+async function doSwapLocal() {
+  try {
+    const d = await (await fetch('/api/local-token')).json();
+    if (!d.token) { showMsg('No credentials file on this server. Use Login with Claude.', 'err'); return; }
+    await swap(d.token);
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+}
+
+async function swap(token) {
+  try {
+    const d = await post('/api/swap', {refresh_token: token});
+    if (d.status === 'ok') { showMsg('Swapped! Expires in ' + d.expires_in_minutes + ' min', 'ok'); loadStatus(); }
+    else showMsg(d.error || d.detail || JSON.stringify(d), 'err');
+  } catch(e) { showMsg(friendlyErr(e), 'err'); }
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  return r.json();
+}
+function showMsg(text, type) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + type;
+}
+function setText(id, text, cls) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'val' + (cls ? ' '+cls : '');
+}
+function friendlyErr(e) {
+  if (e.message && e.message.includes('NetworkError')) return 'Panel backend unreachable. Is ccg-panel running?';
+  return 'Failed: ' + e.message;
+}
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+loadStatus();
+setInterval(loadStatus, 30000);
+fetch('/api/local-token').then(r => r.json()).then(d => {
+  if (!d.token) document.getElementById('btn-local').style.display = 'none';
+}).catch(() => {});
+</script>
+</body>
+</html>"""
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def login_start() -> str:
+    global _pkce
+    verifier = b64url(secrets.token_bytes(32))
+    state = b64url(secrets.token_bytes(32))
+    _pkce = {"verifier": verifier, "state": state}
+    params = {
+        "code": "true",
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "code_challenge": b64url(hashlib.sha256(verifier.encode("ascii")).digest()),
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    return f"{AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def parse_pasted_code(text: str) -> tuple[str, str | None]:
+    """Claude's callback page shows `code#state`; also accept a full callback URL."""
+    text = text.strip()
+    if "code=" in text:
+        q = parse_qs(urlparse(text).query)
+        return q.get("code", [""])[0], q.get("state", [None])[0]
+    code, _, state = text.partition("#")
+    return code, state or None
+
+
+def exchange_code(code: str, verifier: str, state: str) -> dict:
+    body = json.dumps({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "client_id": CLIENT_ID,
+        "code_verifier": verifier,
+        "state": state,
+    }).encode()
+    req = Request(TOKEN_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", UA)
+    return json.loads(urlopen(req, timeout=30).read())
+
+
+def gateway_swap(refresh_token: str) -> tuple[int, dict]:
+    req = Request(f"{GATEWAY}/_oauth", data=json.dumps({"refresh_token": refresh_token}).encode(), method="POST")
+    req.add_header("x-api-key", CLIENT_TOKEN)
+    req.add_header("Content-Type", "application/json")
+    try:
+        return 200, json.loads(urlopen(req, timeout=30).read())
+    except HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            self._send(200, HTML.encode(), "text/html; charset=utf-8")
+        elif self.path == "/api/health":
+            try:
+                self._json(200, json.loads(urlopen(Request(f"{GATEWAY}/_health"), timeout=5).read()))
+            except HTTPError as e:
+                self._json(e.code, json.loads(e.read() or b"{}"))
+            except Exception as e:
+                self._json(502, {"error": str(e)})
+        elif self.path == "/api/local-token":
+            self._json(200, {"token": get_local_refresh_token()})
+        elif self.path == "/api/login-start":
+            self._json(200, {"auth_url": login_start()})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid JSON"})
+            return
+        if self.path == "/api/swap":
+            self._json(*gateway_swap(body.get("refresh_token", "")))
+        elif self.path == "/api/login-finish":
+            self._login_finish(body.get("code", ""))
+        else:
+            self._json(404, {"error": "not found"})
+
+    def _login_finish(self, pasted: str):
+        global _pkce
+        if not _pkce:
+            self._json(400, {"error": "No login in progress. Click Login with Claude first."})
+            return
+        code, state = parse_pasted_code(pasted)
+        if not code:
+            self._json(400, {"error": "Could not find a code in what you pasted."})
+            return
+        if state and state != _pkce["state"]:
+            self._json(400, {"error": "State mismatch: this code is from an older login. Click Login with Claude again."})
+            return
+        try:
+            tokens = exchange_code(code, _pkce["verifier"], _pkce["state"])
+        except HTTPError as e:
+            self._json(502, {"error": f"Code rejected by Claude ({e.code}): {e.read().decode()[:200]}. If it says invalid_grant, click Login with Claude again."})
+            return
+        except Exception as e:
+            self._json(502, {"error": f"Token exchange failed: {e}"})
+            return
+        if not tokens.get("refresh_token"):
+            self._json(502, {"error": "No refresh_token in Claude's response"})
+            return
+        _pkce = None
+        self._json(*gateway_swap(tokens["refresh_token"]))
+
+    def _json(self, code, data):
+        self._send(code, json.dumps(data).encode(), "application/json")
+
+    def _send(self, code, body, ctype):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def get_local_refresh_token():
+    try:
+        rt = json.loads(LOCAL_CREDS.read_text()).get("claudeAiOauth", {}).get("refreshToken", "")
+        return rt if rt.startswith("sk-ant-ort01-") else None
+    except Exception:
+        return None
+
+
+def selftest():
+    assert parse_pasted_code("abc#xyz") == ("abc", "xyz")
+    assert parse_pasted_code("  abc  ") == ("abc", None)
+    assert parse_pasted_code("https://platform.claude.com/oauth/code/callback?code=abc&state=xyz") == ("abc", "xyz")
+    url = login_start()
+    q = parse_qs(urlparse(url).query)
+    assert url.startswith(AUTHORIZE_URL) and len(q["state"][0]) == 43 and len(_pkce["verifier"]) == 43
+    assert q["code_challenge"][0] == b64url(hashlib.sha256(_pkce["verifier"].encode()).digest())
+    print("selftest ok")
+
+
+def main():
+    if sys.argv[1:] == ["--selftest"]:
+        selftest()
+        return
+    if not CLIENT_TOKEN:
+        sys.exit("CCG_CLIENT_TOKEN is not set (use any client token from the gateway's config.yaml)")
+    server = HTTPServer((BIND, PORT), Handler)
+    url = f"http://{BIND}:{PORT}"
+    print(f"CCG Panel: {url}")
+    if BIND == "127.0.0.1" and sys.stdout.isatty():
+        import webbrowser
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
