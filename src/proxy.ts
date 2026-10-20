@@ -5,7 +5,7 @@ import { request as httpsRequest } from 'https'
 import { URL } from 'url'
 import { randomUUID } from 'crypto'
 import type { Config } from './config.js'
-import { authenticate, initAuth, isAdmin } from './auth.js'
+import { authenticate, initAuth, isAdminRequest } from './auth.js'
 import { endGrace, rotateClientToken, RotateError } from './rotate.js'
 import { resolve } from 'path'
 import { getAccessToken, swapOAuth } from './oauth.js'
@@ -176,7 +176,7 @@ async function handleRequest(
 
   // Admin: rotate a client's token (old one valid 24h unless grace=false), or end a grace period now
   if ((path === '/_admin/rotate' || path === '/_admin/end-grace') && method === 'POST') {
-    if (!isAdmin(config, clientName)) {
+    if (!isAdminRequest(req)) {
       res.writeHead(403, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ error: 'Admin only' }))
       return

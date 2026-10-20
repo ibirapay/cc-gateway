@@ -19,30 +19,36 @@ export function initAuth(config: Config) {
   }
 }
 
-function lookup(token: string): TokenEntry | null {
+function lookup(token: string): Slot | null {
   const slot = tokenMap.get(token)
   if (!slot) return null
   if (slot.expiresAt !== undefined && Date.now() >= slot.expiresAt) return null
-  return slot.entry
+  return slot
 }
 
-/**
- * Authenticate by x-api-key, or a Bearer token in Authorization/Proxy-Authorization.
- * Returns the client name (for audit logging) or null if unauthorized.
- */
-export function authenticate(req: IncomingMessage): string | null {
+/** First valid slot from x-api-key, then a Bearer token in Authorization/Proxy-Authorization. */
+function match(req: IncomingMessage): Slot | null {
   const apiKey = req.headers['x-api-key']
   if (apiKey && typeof apiKey === 'string') {
-    const entry = lookup(apiKey)
-    if (entry) return entry.name
+    const slot = lookup(apiKey)
+    if (slot) return slot
   }
   const authHeader = req.headers['proxy-authorization'] || req.headers['authorization']
   if (!authHeader || typeof authHeader !== 'string') return null
-  const match = authHeader.match(/^bearer\s+(.+)$/i)
-  if (!match) return null
-  return lookup(match[1])?.name ?? null
+  const bearer = authHeader.match(/^bearer\s+(.+)$/i)
+  return bearer ? lookup(bearer[1]) : null
 }
 
-export function isAdmin(config: Config, name: string): boolean {
-  return config.auth.tokens.some((t) => t.name === name && t.admin === true)
+/** Returns the client name (for audit logging) or null if unauthorized. */
+export function authenticate(req: IncomingMessage): string | null {
+  return match(req)?.entry.name ?? null
+}
+
+/**
+ * Admin routes need an admin client's CURRENT token: a grace-period token may be
+ * the leaked one being rotated away, so it must not be able to rotate anything.
+ */
+export function isAdminRequest(req: IncomingMessage): boolean {
+  const slot = match(req)
+  return !!slot && slot.expiresAt === undefined && slot.entry.admin === true
 }

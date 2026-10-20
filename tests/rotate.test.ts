@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import type { IncomingMessage } from 'node:http'
 import { loadConfig } from '../src/config.js'
-import { authenticate, initAuth, isAdmin } from '../src/auth.js'
+import { authenticate, initAuth } from '../src/auth.js'
 import { endGrace, GRACE_MS, rotateClientToken, RotateError } from '../src/rotate.js'
 import { startProxy } from '../src/proxy.js'
 
@@ -87,7 +87,6 @@ const req = (key: string) => ({ headers: { 'x-api-key': key } }) as unknown as I
   assert.ok(nesi.launcher?.content.includes(`CLIENT_TOKEN="${nesi.token}"`))
 
   assert.throws(() => rotateClientToken(config, cfgPath, 'ghost'), (e) => e instanceof RotateError && e.status === 404)
-  assert.ok(isAdmin(config, 'admin') && !isAdmin(config, 'nodge'))
   rmSync(dir, { recursive: true })
 }
 
@@ -154,6 +153,13 @@ const req = (key: string) => ({ headers: { 'x-api-key': key } }) as unknown as I
   const nogr = await rotate(T('a'), 'nesi', false)
   assert.equal(((await nogr.json()) as { previous_valid_until: unknown }).previous_valid_until, null)
   assert.equal(await verify(T('c')), 401, 'grace=false kills the old token over HTTP')
+
+  // the admin's own token rotated with grace: the old (maybe leaked) one may still proxy, never administer
+  const self = (await (await rotate(T('a'), 'admin')).json()) as { token: string; self: boolean }
+  assert.equal(self.self, true)
+  assert.equal(await verify(T('a')), 200, 'old admin token still proxies during grace')
+  assert.equal((await rotate(T('a'), 'nodge')).status, 403, 'grace token cannot use admin routes')
+  assert.equal((await rotate(self.token, 'nodge')).status, 200, 'current admin token can')
   server.close()
   rmSync(dir, { recursive: true })
 }
