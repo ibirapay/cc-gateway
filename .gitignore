@@ -13,3 +13,5 @@ dist.bak.*/
 active-proxy.txt
 usage-*-state.json
 cc-health.conf
+conversation-history/
+instances/

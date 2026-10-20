@@ -5,7 +5,9 @@ import { request as httpsRequest } from 'https'
 import { URL } from 'url'
 import { randomUUID } from 'crypto'
 import type { Config } from './config.js'
-import { authenticate, initAuth } from './auth.js'
+import { authenticate, initAuth, isAdminRequest } from './auth.js'
+import { addClient, endGrace, rotateClientToken, RotateError } from './rotate.js'
+import { resolve } from 'path'
 import { getAccessToken, swapOAuth } from './oauth.js'
 import { audit, log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
@@ -50,7 +52,8 @@ function sanitizeHeaders(
   return out
 }
 
-export function startProxy(config: Config) {
+export function startProxy(config: Config, configPath?: string) {
+  const cfgPath = configPath || resolve(process.cwd(), 'config.yaml')
   initAuth(config)
 
   // Initialize rate limiter with global limit applied to all clients equally
@@ -81,7 +84,7 @@ export function startProxy(config: Config) {
       log('warn', `Client response error: ${err.message}`)
     })
 
-    handleRequest(req, res, config, upstream).catch((err) => {
+    handleRequest(req, res, config, upstream, cfgPath).catch((err) => {
       log('error', `Unhandled error in handleRequest: ${err instanceof Error ? err.message : err}`)
       if (!res.headersSent) {
         try {
@@ -121,6 +124,7 @@ async function handleRequest(
   res: ServerResponse,
   config: Config,
   upstream: URL,
+  configPath: string,
 ) {
   const method = req.method || 'GET'
   const path = req.url || '/'
@@ -169,6 +173,55 @@ async function handleRequest(
   }
 
   log('info', `[${requestId}] Client "${clientName}" → ${method} ${path}`)
+
+  // Admin: rotate a client's token (old one valid 24h unless grace=false), or end a grace period now
+  if (['/_admin/rotate', '/_admin/end-grace', '/_admin/add-client'].includes(path) && method === 'POST') {
+    if (!isAdminRequest(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: 'Admin only' }))
+      return
+    }
+    const chunks: Buffer[] = []
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+    }
+    let status = 200
+    let payload: unknown
+    try {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      const name = body?.name
+      if (!name || typeof name !== 'string') throw new RotateError(400, 'Missing client name')
+      if (path === '/_admin/add-client') {
+        const r = addClient(config, configPath, name)
+        log('info', `[${requestId}] Client "${clientName}" added client "${name}"`)
+        payload = { status: 'ok', name: r.name, token: r.token, previous_valid_until: null, self: false, added: true, launcher: r.launcher }
+      } else if (path === '/_admin/end-grace') {
+        endGrace(config, configPath, name)
+        log('info', `[${requestId}] Client "${clientName}" ended the grace period of "${name}"`)
+        payload = { status: 'ok', name }
+      } else {
+        const r = rotateClientToken(config, configPath, name, Date.now(), body?.grace !== false)
+        const until = r.previousValidUntil === null ? 'killed now' : `valid until ${new Date(r.previousValidUntil).toISOString()}`
+        log('info', `[${requestId}] Client "${clientName}" rotated the token of "${name}" (old token ${until})`)
+        payload = {
+          status: 'ok',
+          name: r.name,
+          token: r.token,
+          previous_valid_until: r.previousValidUntil,
+          self: r.name === clientName,
+          launcher: r.launcher,
+        }
+      }
+    } catch (err) {
+      status = err instanceof RotateError ? err.status : err instanceof SyntaxError ? 400 : 500
+      payload = { error: err instanceof Error ? err.message : String(err) }
+      log('error', `[${requestId}] Token rotation failed: ${(payload as { error: string }).error}`)
+    }
+    if (config.logging.audit) audit(clientName, method, path, status)
+    res.writeHead(status, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(payload))
+    return
+  }
 
   // OAuth swap endpoint — authenticated client can replace the refresh token
   if (path === '/_oauth' && method === 'POST') {
@@ -299,6 +352,16 @@ async function handleRequest(
           responseBytes += chunk.length
         }
       })
+
+      // Log upstream error bodies so we know WHY Anthropic rejected a request.
+      if (status === 401 || status === 403) {
+        const errChunks: Buffer[] = []
+        proxyRes.on('data', (c: Buffer) => errChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+        proxyRes.on('end', () => {
+          const body = Buffer.concat(errChunks).toString('utf8').slice(0, 500)
+          log('warn', `[${requestId}] upstream ${status} for ${clientName}: ${body}`)
+        })
+      }
 
       // Stream response directly (SSE for Claude responses)
       proxyRes.pipe(res)

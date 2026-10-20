@@ -1,43 +1,54 @@
 import type { IncomingMessage } from 'http'
 import type { Config, TokenEntry } from './config.js'
 
-const tokenMap = new Map<string, TokenEntry>()
+type Slot = { entry: TokenEntry; expiresAt?: number }
+
+const tokenMap = new Map<string, Slot>()
 
 /**
- * Initialize the authentication system with configured client tokens.
- * Builds an in-memory lookup map for fast token validation on each request.
- * @param config - Gateway configuration containing auth.tokens array
+ * Build the in-memory token lookup. A rotated client's previous token is
+ * registered too, until its grace period (previous_expires_at) ends.
  */
 export function initAuth(config: Config) {
   tokenMap.clear()
   for (const entry of config.auth.tokens) {
-    tokenMap.set(entry.token, entry)
+    tokenMap.set(entry.token, { entry })
+    if (entry.previous_token && (entry.previous_expires_at ?? 0) > Date.now()) {
+      tokenMap.set(entry.previous_token, { entry, expiresAt: entry.previous_expires_at })
+    }
   }
 }
 
-/**
- * Authenticate incoming request by API key or Bearer token.
- * Supports both x-api-key header and Bearer token in Authorization/Proxy-Authorization headers.
- * Returns the token entry name (for audit logging) or null if unauthorized.
- * @param req - Incoming HTTP request
- * @returns Client name if authenticated, null otherwise
- */
-export function authenticate(req: IncomingMessage): string | null {
-  // CC with ANTHROPIC_API_KEY sends x-api-key header
+function lookup(token: string): Slot | null {
+  const slot = tokenMap.get(token)
+  if (!slot) return null
+  if (slot.expiresAt !== undefined && Date.now() >= slot.expiresAt) return null
+  return slot
+}
+
+/** First valid slot from x-api-key, then a Bearer token in Authorization/Proxy-Authorization. */
+function match(req: IncomingMessage): Slot | null {
   const apiKey = req.headers['x-api-key']
   if (apiKey && typeof apiKey === 'string') {
-    const entry = tokenMap.get(apiKey)
-    if (entry) return entry.name
+    const slot = lookup(apiKey)
+    if (slot) return slot
   }
-
-  // Fallback: Bearer token in Authorization or Proxy-Authorization (case-insensitive)
   const authHeader = req.headers['proxy-authorization'] || req.headers['authorization']
   if (!authHeader || typeof authHeader !== 'string') return null
+  const bearer = authHeader.match(/^bearer\s+(.+)$/i)
+  return bearer ? lookup(bearer[1]) : null
+}
 
-  // Match Bearer token with case-insensitive prefix (handles Bearer, bearer, BEARER)
-  const match = authHeader.match(/^bearer\s+(.+)$/i)
-  if (!match) return null
+/** Returns the client name (for audit logging) or null if unauthorized. */
+export function authenticate(req: IncomingMessage): string | null {
+  return match(req)?.entry.name ?? null
+}
 
-  const entry = tokenMap.get(match[1])
-  return entry?.name ?? null
+/**
+ * Admin routes need an admin client's CURRENT token: a grace-period token may be
+ * the leaked one being rotated away, so it must not be able to rotate anything.
+ */
+export function isAdminRequest(req: IncomingMessage): boolean {
+  const slot = match(req)
+  return !!slot && slot.expiresAt === undefined && slot.entry.admin === true
 }

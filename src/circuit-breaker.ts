@@ -93,6 +93,15 @@ export function recordFailure(reason?: string): void {
  * Check if the circuit is currently open (should reject requests).
  */
 export function isOpen(): boolean {
+  if (breaker.state === 'open' && breaker.openedAt) {
+    if (Date.now() - breaker.openedAt > COOLDOWN_MS) {
+      breaker.state = 'half-open'
+      breaker.successCount = 0
+      breaker.failureCount = 0
+      log('info', 'Circuit breaker: transitioned to half-open (attempting recovery)')
+      return false
+    }
+  }
   return breaker.state === 'open'
 }
 

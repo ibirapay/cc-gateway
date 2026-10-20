@@ -2,14 +2,27 @@ import { request as httpsRequest } from 'https'
 import { log } from './logger.js'
 import { getProxyAgent } from './proxy-agent.js'
 
+/** Subset of Discord's embed object we actually use. */
+export type DiscordEmbed = {
+  title?: string
+  description?: string
+  color?: number
+  fields?: { name: string; value: string; inline?: boolean }[]
+  footer?: { text: string }
+  timestamp?: string
+}
+
 /**
  * Send a message to a Discord webhook. Routes through the gateway's egress proxy.
  * Never throws — webhook failures are logged but never affect client requests.
  * @param webhook - Discord webhook URL
- * @param content - Message content (capped at 2000 chars per Discord limit)
+ * @param msg - Plain content string (capped at 1990 chars), or an embed payload
  * @returns Promise that resolves when webhook delivery is complete (success or failure)
  */
-export function sendDiscord(webhook: string, content: string): Promise<void> {
+export function sendDiscord(
+  webhook: string,
+  msg: string | { content?: string; embeds?: DiscordEmbed[] },
+): Promise<void> {
   return new Promise((done) => {
     let url: URL
     try {
@@ -19,7 +32,8 @@ export function sendDiscord(webhook: string, content: string): Promise<void> {
       return done()
     }
 
-    const body = JSON.stringify({ content: content.slice(0, 1990), username: 'CC Gateway' })
+    const payload = typeof msg === 'string' ? { content: msg.slice(0, 1990) } : msg
+    const body = JSON.stringify({ ...payload, username: 'CC Gateway' })
     const agent = getProxyAgent()
     const req = httpsRequest(
       {

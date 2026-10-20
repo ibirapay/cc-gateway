@@ -63,7 +63,7 @@ try {
     })
   }
 
-  startProxy(config)
+  startProxy(config, configPath)
 } catch (err) {
   console.error(`Fatal: ${err instanceof Error ? err.message : err}`)
   process.exit(1)

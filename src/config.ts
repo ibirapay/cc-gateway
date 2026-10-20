@@ -5,6 +5,11 @@ import { resolve } from 'path'
 export type TokenEntry = {
   name: string
   token: string
+  // May call /_admin/* routes (e.g. rotate other clients' tokens)
+  admin?: boolean
+  // Set by a rotation: the replaced token keeps working until previous_expires_at (ms epoch)
+  previous_token?: string
+  previous_expires_at?: number
 }
 
 export type Config = {
@@ -65,6 +70,11 @@ export type Config = {
   notify?: {
     discord_webhook?: string
     usage_report_interval_hours?: number
+  }
+  // Client launcher scripts (clients/<file>) rewritten on token rotation
+  clients?: {
+    dir?: string          // default: <config dir>/clients
+    gateway_url?: string  // GATEWAY_URL written into regenerated launchers (default: keep the old one)
   }
   // Conversation history logging for regulatory retention.
   // Stores full request/response bodies as gzipped JSONL per day.
@@ -142,6 +152,7 @@ function validateConfig(config: Config): void {
       throw new Error(`config: notify.discord_webhook is not a valid Discord webhook URL: ${err instanceof Error ? err.message : err}`)
     }
   }
+
 
   // Logging validation
   if (config.logging?.level && !['debug', 'info', 'warn', 'error'].includes(config.logging.level)) {
