@@ -407,7 +407,14 @@ def gateway_post(path: str, payload: dict) -> tuple[int, dict]:
     try:
         return 200, json.loads(urlopen(req, timeout=30).read())
     except HTTPError as e:
-        return e.code, json.loads(e.read() or b"{}")
+        try:
+            data = json.loads(e.read() or b"{}")
+        except ValueError:
+            data = {}
+        if not isinstance(data, dict) or not isinstance(data.get("error"), str):
+            hint = ": this gateway has no such route, deploy the new gateway first" if e.code == 404 else ""
+            data = {"error": f"Gateway answered {e.code}{hint}"}
+        return e.code, data
 
 
 def request_problem(method: str, headers) -> tuple[int, str] | None:
