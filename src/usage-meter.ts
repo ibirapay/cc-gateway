@@ -691,7 +691,13 @@ function allEmbeds(): DiscordEmbed[] {
     return cachedEmbeds
   }
 
-  const rows = [...clients.entries()].sort((a, b) => total(b[1]) - total(a[1]))
+  // Ordem = US$, não tokens. Modelos custam por token diferente, e cache lido
+  // vale 0.025–0.1× do novo — "mais tokens" mente sobre quem gasta a cota.
+  // O desempate por tokens só segura cliente sem preço na tabela (costUsd 0)
+  // no fundo do ranking, em vez de sumir dele.
+  const rows = [...clients.entries()].sort(
+    (a, b) => b[1].costUsd - a[1].costUsd || total(b[1]) - total(a[1]),
+  )
   const sinceStr = toBRT(since)
 
   const cache = (embeds: DiscordEmbed[]): DiscordEmbed[] => {
@@ -711,7 +717,8 @@ function allEmbeds(): DiscordEmbed[] {
 
   const sum = (f: (c: Counters) => number) => rows.reduce((s, [, c]) => s + f(c), 0)
   const grand = sum(total)
-  const top = total(rows[0][1]) || 1
+  const costTop = rows[0][1].costUsd || 1
+  const anyCost = rows[0][1].costUsd > 0
   const nameW = Math.max(...rows.map(([n]) => Math.min(12, n.length)))
   const tReq = sum((c) => c.requests)
   const tInf = sum(inferenceReqs)
@@ -724,9 +731,11 @@ function allEmbeds(): DiscordEmbed[] {
       name.slice(0, nameW).padEnd(nameW),
       // Barra encolhida de 18 pra 12: abre espaço pra coluna nova sem alongar a
       // linha, que quebra feio no code block do Discord mobile.
-      bar(total(c) / top, 12),
+      bar(c.costUsd / costTop, 12),
+      // Coluna de US$ no lugar do % de tokens: com a ordem por custo, um % de
+      // tokens ao lado pareceria uma ordenação quebrada. `—` = sem preço.
+      (c.costUsd ? c.costUsd.toFixed(2) : '—').padStart(7),
       fmt(total(c)).padStart(6),
-      `${((total(c) / (grand || 1)) * 100).toFixed(0).padStart(3)}%`,
       fmtPer(perReq(c)).padStart(6),
       c.errors ? `💥${c.errors}` : '',
     ]
@@ -766,7 +775,7 @@ function allEmbeds(): DiscordEmbed[] {
   const [priciest, priciestC] = best((c) => c.costUsd)
   if (priciestC.costUsd > 0) {
     highlights.push({
-      name: '💸 Mais caro',
+      name: '💸 Maior custo API',
       value: `${priciest}\nUS$ ${priciestC.costUsd.toFixed(2)}`,
       inline: true,
     })
@@ -846,7 +855,9 @@ function allEmbeds(): DiscordEmbed[] {
     color: ACCENT,
     timestamp: new Date(now).toISOString(),
     description: [
-      `**${rows[0][0]}** lidera com **${fmt(top)}** tokens.`,
+      anyCost
+        ? `**${rows[0][0]}** lidera com **US$ ${rows[0][1].costUsd.toFixed(2)}** em custo de API.`
+        : `**${rows[0][0]}** lidera com **${fmt(total(rows[0][1]))}** tokens (nenhum preço na tabela).`,
       '```',
       ...board,
       '```',
@@ -864,7 +875,7 @@ function allEmbeds(): DiscordEmbed[] {
             : null,
           [
             cost || unpriced
-              ? `💰 US$ ${cost.toFixed(2)}` + (unpriced ? ` (${unpriced} reqs sem preço)` : '')
+              ? `💰 US$ ${cost.toFixed(2)} em API` + (unpriced ? ` (${unpriced} reqs sem preço)` : '')
               : null,
             totalIn ? `🧠 ${((sum((c) => c.cacheReadTokens) / totalIn) * 100).toFixed(0)}% cache` : null,
           ]
@@ -899,7 +910,7 @@ function allEmbeds(): DiscordEmbed[] {
     ],
     // Legenda no rodapé em vez de cabeçalho dentro do code block: alinhar
     // cabeçalho com padEnd é frágil e quebra assim que um nome muda de tamanho.
-    footer: { text: `desde ${sinceStr} · colunas: total · % · tokens por chamada` },
+    footer: { text: `desde ${sinceStr} · colunas: US$ · tokens · tokens por chamada` },
   }
 
   // Per-user detail embeds
