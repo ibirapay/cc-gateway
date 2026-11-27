@@ -15,7 +15,6 @@ import { maybeNotifyUsage } from './usage-notify.js'
 import { attachUsage, recordRequest, recordMetrics } from './usage-meter.js'
 import { logRequestStart, logResponseAttach, logRequestError } from './conversation-log.js'
 import { initRateLimiter, checkRateLimit, logRateLimitHit } from './rate-limiter.js'
-import { isOpen, recordSuccess, recordFailure } from './circuit-breaker.js'
 
 // Headers that must NOT be forwarded upstream: hop-by-hop framing headers and
 // the client's own auth (the gateway injects the real OAuth token below).
@@ -277,16 +276,6 @@ async function handleRequest(
     return
   }
 
-  // Check circuit breaker
-  if (isOpen()) {
-    if (config.logging.audit) {
-      audit(clientName, method, path, 503)
-    }
-    res.writeHead(503, { 'Content-Type': 'application/json', 'x-request-id': requestId })
-    res.end(JSON.stringify({ error: 'Gateway circuit breaker is open - upstream service unavailable' }))
-    return
-  }
-
   // Get the real OAuth token (managed by gateway)
   const oauthToken = getAccessToken()
   if (!oauthToken) {
@@ -397,16 +386,6 @@ async function handleRequest(
         recordMetrics(clientName, latencyMs, requestBytes, responseBytes)
       })
 
-      // Record circuit breaker state based on response
-      if (status >= 500) {
-        recordFailure(`upstream returned ${status}`)
-      } else if (status >= 400 && status < 500) {
-        // Client errors (4xx) don't trip circuit breaker
-        recordSuccess()
-      } else {
-        recordSuccess()
-      }
-
       // Watch the shared account's usage headers and ping Discord on 5% bands.
       maybeNotifyUsage(proxyRes.headers)
 
@@ -416,10 +395,13 @@ async function handleRequest(
     },
   )
 
-  // Headers-only watchdog: when the egress proxy stalls or upstream is slow to
-  // start responding, the request would otherwise hang until the client aborts
+  // Headers-only watchdog: when the egress stalls or upstream is slow to start
+  // responding, the request would otherwise hang until the client aborts
   // (~50 s of dead time, no AUDIT line). Destroying with an error routes into
-  // the 'error' handler below: 502 + circuit-breaker failure + audit.
+  // the 'error' handler below: 502 + audit — the real error reaches the client
+  // and the client (Claude Code) decides whether to retry. The circuit breaker
+  // that used to sit here was removed 2026-11-26: it was masking a merely-slow
+  // upstream as a blanket 503 for everyone (incident review of the day).
   // Cleared as soon as headers arrive, so long SSE streams are never cut.
   // 2026-11-26: was hardcoded 30s on the deployed box; Anthropic regularly takes
   // 30-60s to emit the first headers under peak load, so it is 60s by default
@@ -450,7 +432,6 @@ async function handleRequest(
       res.end(JSON.stringify({ error: 'Bad gateway', detail: err.message }))
     }
     recordRequest(clientName, 502)
-    recordFailure(`connection error: ${err.message}`)
     if (config.logging.audit) {
       audit(clientName, method, path, 502)
     }

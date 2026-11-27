@@ -45,7 +45,7 @@ CC Gateway is a reverse proxy that sits between Claude Code clients and the Anth
 - **Multi-instance** — `spawn-instance.sh` creates isolated gateway instances (own port, OAuth, config, history). Use for budget isolation: 1 account = 1 user, never run out of tokens on both
 - **Zero-login client setup** — clients receive a single launcher script. No browser OAuth, no `~/.zshrc` changes, no config files
 - **Usage alerting** — Discord notifications when the shared account's 7-day utilization crosses each 5% band
-- **Circuit breaker** — opens after consecutive upstream failures, auto-recovers. Protects clients from cascading errors
+- **Headers watchdog** — an upstream that does not emit response headers within 60s gets the request aborted with a 502 carrying the real error; the client decides whether to retry. (A circuit breaker lived here until 2026-11-26; it turned a merely-slow upstream into blanket 503s and was removed)
 - **Rate limiting** — shared global sliding-window limiter to prevent runaway clients from burning the account
 - **Egress proxy tiers** — automatic failover across proxy tiers (residential → Tailscale → datacenter) with hot-reload via SIGHUP
 - **Instant startup** — uses existing access token on launch. No network call until the token actually expires
@@ -201,7 +201,7 @@ Client machines                        CC Gateway                    Anthropic
 |------|-------------|
 | 1. Auth | Client's `x-api-key` matched to a named user |
 | 2. Rate limit | Sliding-window check (shared pool) |
-| 3. Circuit breaker | Upstream health gate |
+| 3. Headers watchdog | 60s cap on upstream response headers (then 502; see `upstream.headers_timeout_seconds`) |
 | 4. OAuth inject | Client token swapped for shared OAuth token |
 | 5. Forward | Request body forwarded unchanged to `api.anthropic.com` |
 | 6. Stream back | SSE response piped to client |
@@ -258,7 +258,7 @@ The gateway manages the full OAuth token lifecycle:
 - Clients run one file — no browser login, no config files
 
 **Reliability**
-- Circuit breaker (5 consecutive 5xx → open, 60s cooldown)
+- Headers watchdog (60s no-headers → 502 with the real error; clients retry)
 - Rate limiter (shared global sliding-window)
 - Egress proxy tiers with automatic failover and hot-reload via SIGHUP
 
