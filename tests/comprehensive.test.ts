@@ -627,89 +627,23 @@ test(
   String(unlimitedClient),
 )
 
-// TEST 12: Circuit Breaker
-console.log('\nTEST 12: Circuit Breaker')
-console.log('Scenario: Verify state transitions and thresholds\n')
-
-interface CircuitState {
-  state: 'closed' | 'open' | 'half-open'
-  failureCount: number
-  successCount: number
-  openedAt?: number
-}
-
-const FAILURE_THRESHOLD = 5
-const COOLDOWN_MS = 60_000
-const SUCCESS_THRESHOLD = 3
-
-let breaker: CircuitState = {
-  state: 'closed',
-  failureCount: 0,
-  successCount: 0,
-}
-
-// Simulate 5 failures
-for (let i = 0; i < 5; i++) {
-  breaker.failureCount++
-  if (breaker.failureCount >= FAILURE_THRESHOLD) {
-    breaker.state = 'open'
-    breaker.openedAt = Date.now()
-    break
-  }
-}
-
+// TEST 12: Circuit breaker removed 2026-11-26 — real upstream errors reach the client;
+// the headers watchdog in proxy.ts is the remaining guard
+console.log('\nTEST 12: Circuit Breaker Removed')
+const proxySrc = readFileSync(resolve('src/proxy.ts'), 'utf-8')
 test(
   12,
-  'Circuit opens after failures',
-  'Should open after 5 consecutive failures',
-  'open',
-  String(breaker.state),
+  'No breaker code',
+  'proxy.ts must not reference the circuit breaker',
+  'true',
+  String(!proxySrc.includes('circuit-breaker') && !proxySrc.includes('isOpen()')),
 )
-
-// Test returns 503 when open
-const shouldReject = breaker.state === 'open'
 test(
   12.1,
-  'Reject requests when open',
-  'Should return 503 when circuit is open',
+  'Headers watchdog present',
+  'proxy.ts must keep the headersTimer watchdog',
   'true',
-  String(shouldReject),
-)
-
-// Simulate cooldown passage and transition to half-open
-const now2 = Date.now()
-if (breaker.openedAt && now2 - breaker.openedAt > COOLDOWN_MS) {
-  breaker.state = 'half-open'
-  breaker.failureCount = 0
-  breaker.successCount = 0
-}
-
-// Can't fully test cooldown without waiting, so test state machine logic
-const halfOpenStateExists = ['closed', 'open', 'half-open'].includes('half-open')
-test(
-  12.2,
-  'Half-open state exists',
-  'Should support half-open recovery state',
-  'true',
-  String(halfOpenStateExists),
-)
-
-// Test close after 3 successes in half-open
-breaker.state = 'half-open'
-for (let i = 0; i < 3; i++) {
-  breaker.successCount++
-  if (breaker.successCount >= SUCCESS_THRESHOLD) {
-    breaker.state = 'closed'
-    break
-  }
-}
-
-test(
-  12.3,
-  'Circuit closes after recovery',
-  'Should close after 3 successes in half-open state',
-  'closed',
-  String(breaker.state),
+  String(proxySrc.includes('headersTimer')),
 )
 
 // TEST 13: Enhanced Metrics
@@ -843,7 +777,7 @@ const testNames = [
   'Webhook URL Validation',
   'Summary Text Caching',
   'Per-Client Rate Limiting',
-  'Circuit Breaker',
+  'Circuit Breaker Removed',
   'Enhanced Metrics',
 ]
 

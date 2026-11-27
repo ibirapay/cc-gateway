@@ -22,8 +22,8 @@ export type Config = {
   }
   upstream: {
     url: string
-    // Max seconds to wait for upstream response HEADERS before aborting the request
-    // (502 + circuit-breaker failure). Cleared once headers arrive, so long SSE
+    // Max seconds to wait for upstream response HEADERS before aborting the
+    // request (502 to the client). Cleared once headers arrive, so long SSE
     // streams are never cut. Default: 60.
     headers_timeout_seconds?: number
   }

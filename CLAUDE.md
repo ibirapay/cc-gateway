@@ -28,11 +28,15 @@ CC Gateway is a **stateless OAuth-swap reverse proxy** between Claude Code clien
 ### Request lifecycle (proxy.ts)
 
 ```
-Client → auth (x-api-key lookup) → rate limit → circuit breaker
+Client → auth (x-api-key lookup) → rate limit
 → OAuth token injection → forward to api.anthropic.com → pipe SSE response back
                                                        ↳ tap: usage metering
                                                        ↳ tap: conversation log
 ```
+
+No circuit breaker (removed 2026-11-26): the only upstream guard is the 60s
+headers watchdog in proxy.ts → 502 with the real error, and the client (Claude
+Code) decides whether to retry.
 
 The request body is fully buffered (`Buffer.concat`) before forwarding. Response is streamed via `pipe()` with non-destructive taps attached in the same tick.
 
@@ -47,7 +51,6 @@ The request body is fully buffered (`Buffer.concat`) before forwarding. Response
 | `usage-notify.ts` | Watches Anthropic `anthropic-ratelimit-unified-*` headers; Discord alerts on 5% utilization bands |
 | `conversation-log.ts` | Full request+response body capture as gzipped JSONL per day (regulatory retention) |
 | `rate-limiter.ts` | Shared global sliding-window RPS limiter |
-| `circuit-breaker.ts` | Opens after 5 consecutive 5xx; 60s cooldown; 4xx does NOT trip |
 | `proxy-agent.ts` | Egress proxy selection, hot-reloadable via SIGHUP |
 
 ### Persistence (all file-based, no database)

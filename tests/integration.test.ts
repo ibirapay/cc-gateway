@@ -473,62 +473,22 @@ try {
   fail('11', 'Per-Client Rate Limiting', String(err))
 }
 
-// TEST 12: Verify Circuit Breaker
-console.log('\nTEST 12: Circuit Breaker\n')
+// TEST 12: Circuit breaker removed 2026-11-26 (real upstream errors reach the client;
+// the headers watchdog in proxy.ts is the remaining guard)
+console.log('\nTEST 12: Circuit Breaker Removed\n')
 
 try {
-  const breakerCode = readFileSync(
-    '/root/cc-gateway/src/circuit-breaker.ts',
-    'utf-8',
-  )
-
-  // Check failure threshold
-  const failureThreshold = breakerCode.includes('FAILURE_THRESHOLD = 5')
-  if (failureThreshold) {
-    pass(
-      '12.1',
-      'Opens after 5 failures',
-      'Found FAILURE_THRESHOLD = 5 at line 21',
-    )
-  }
-
-  // Check cooldown period
-  const cooldown = breakerCode.includes('COOLDOWN_MS = 60_000')
-  if (cooldown) {
-    pass('12.2', 'Stays open for 60 seconds', 'Found 60s cooldown at line 24')
-  }
-
-  // Check success threshold
-  const successThreshold = breakerCode.includes('SUCCESS_THRESHOLD = 3')
-  if (successThreshold) {
-    pass(
-      '12.3',
-      'Closes after 3 successes in half-open',
-      'Found SUCCESS_THRESHOLD = 3 at line 25',
-    )
-  }
-
-  // Check 503 response handling
-  const proxyCode = readFileSync('/root/cc-gateway/src/proxy.ts', 'utf-8')
-  const has503 = proxyCode.includes('isOpen()') && proxyCode.includes('res.writeHead(503')
-  if (has503) {
-    pass('12.4', 'Returns 503 when open', 'Found 503 response at line 175')
-  }
-
-  // Check state machine logic
-  const stateTransitions =
-    breakerCode.includes("breaker.state = 'closed'") &&
-    breakerCode.includes("breaker.state = 'open'") &&
-    breakerCode.includes("breaker.state = 'half-open'")
-  if (stateTransitions) {
-    pass(
-      '12.5',
-      'Complete state machine',
-      'Found all three states (closed, open, half-open)',
-    )
+  const proxyCode = readFileSync('src/proxy.ts', 'utf-8')
+  const removed =
+    !proxyCode.includes('circuit-breaker') && !proxyCode.includes('isOpen()')
+  const watchdog = proxyCode.includes('headersTimer')
+  if (removed && watchdog) {
+    pass('12.1', 'No breaker code, headers watchdog present', 'verified in src/proxy.ts')
+  } else {
+    fail('12.1', 'breaker code still present or watchdog missing', `removed=${removed} watchdog=${watchdog}`)
   }
 } catch (err) {
-  fail('12', 'Circuit Breaker', String(err))
+  fail('12', 'Circuit Breaker Removed', String(err))
 }
 
 // TEST 13: Verify Enhanced Metrics
@@ -624,7 +584,7 @@ const testNames = [
   'Webhook URL Validation',
   'Summary Text Caching',
   'Per-Client Rate Limiting',
-  'Circuit Breaker',
+  'Circuit Breaker Removed',
   'Enhanced Metrics',
 ]
 
