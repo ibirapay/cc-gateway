@@ -22,6 +22,10 @@ export type Config = {
   }
   upstream: {
     url: string
+    // Max seconds to wait for upstream response HEADERS before aborting the request
+    // (502 + circuit-breaker failure). Cleared once headers arrive, so long SSE
+    // streams are never cut. Default: 60.
+    headers_timeout_seconds?: number
   }
   auth: {
     tokens: TokenEntry[]
@@ -115,6 +119,12 @@ function validateConfig(config: Config): void {
     new URL(config.upstream.url)
   } catch {
     throw new Error(`config: upstream.url is not a valid URL: ${config.upstream.url}`)
+  }
+  if (config.upstream.headers_timeout_seconds !== undefined) {
+    const t = config.upstream.headers_timeout_seconds
+    if (!Number.isInteger(t) || t < 5 || t > 600) {
+      throw new Error(`config: upstream.headers_timeout_seconds must be an integer between 5 and 600, got ${t}`)
+    }
   }
 
   // Auth validation

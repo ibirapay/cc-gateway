@@ -279,6 +279,9 @@ async function handleRequest(
 
   // Check circuit breaker
   if (isOpen()) {
+    if (config.logging.audit) {
+      audit(clientName, method, path, 503)
+    }
     res.writeHead(503, { 'Content-Type': 'application/json', 'x-request-id': requestId })
     res.end(JSON.stringify({ error: 'Gateway circuit breaker is open - upstream service unavailable' }))
     return
@@ -287,6 +290,9 @@ async function handleRequest(
   // Get the real OAuth token (managed by gateway)
   const oauthToken = getAccessToken()
   if (!oauthToken) {
+    if (config.logging.audit) {
+      audit(clientName, method, path, 503)
+    }
     res.writeHead(503, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ error: 'OAuth token not available - gateway is refreshing' }))
     log('error', 'No valid OAuth token available')
@@ -322,6 +328,18 @@ async function handleRequest(
 
   // Forward to upstream
   const upstreamUrl = new URL(path, upstream)
+  // The shared OAuth token must only ever leave toward the configured upstream
+  // host: a client-sent "//attacker.example/..." or "http://..." request target
+  // would carry it to an arbitrary host (token leak) or throw synchronously.
+  if (upstreamUrl.origin !== upstream.origin) {
+    log('warn', `[${requestId}] Rejected request target with foreign origin: ${upstreamUrl.origin}`)
+    res.writeHead(400, { 'Content-Type': 'application/json', 'x-request-id': requestId })
+    res.end(JSON.stringify({ error: 'Request target must address the configured upstream host' }))
+    if (config.logging.audit) {
+      audit(clientName, method, path, 400)
+    }
+    return
+  }
 
   const agent = getProxyAgent()
   const proxyReq = httpsRequest(
@@ -336,6 +354,7 @@ async function handleRequest(
       ...(agent && { agent }),
     },
     (proxyRes) => {
+      clearTimeout(headersTimer)
       const status = proxyRes.statusCode || 502
 
       const responseHeaders = { ...proxyRes.headers }
@@ -397,7 +416,33 @@ async function handleRequest(
     },
   )
 
+  // Headers-only watchdog: when the egress proxy stalls or upstream is slow to
+  // start responding, the request would otherwise hang until the client aborts
+  // (~50 s of dead time, no AUDIT line). Destroying with an error routes into
+  // the 'error' handler below: 502 + circuit-breaker failure + audit.
+  // Cleared as soon as headers arrive, so long SSE streams are never cut.
+  // 2026-11-26: was hardcoded 30s on the deployed box; Anthropic regularly takes
+  // 30-60s to emit the first headers under peak load, so it is 60s by default
+  // now, tunable via upstream.headers_timeout_seconds without a redeploy.
+  // ponytail: one limit for stream and non-stream alike — every observed caller
+  // is Claude Code with stream=true, and a non-stream call slow enough to hit
+  // 60s means upstream is down for everyone. Split by stream flag if not.
+  const headersTimeoutSec = config.upstream.headers_timeout_seconds ?? 60
+  const headersTimer = setTimeout(() => {
+    proxyReq.destroy(new Error(`upstream timeout: no response headers after ${headersTimeoutSec}s`))
+  }, headersTimeoutSec * 1000)
+
+  // A client that walks away before any upstream response stops the dead
+  // request instead of letting the watchdog count a 502 nobody waits for.
+  res.on('close', () => {
+    if (!res.headersSent) {
+      clearTimeout(headersTimer)
+      proxyReq.destroy()
+    }
+  })
+
   proxyReq.on('error', (err) => {
+    clearTimeout(headersTimer)
     log('error', `[${requestId}] Upstream error: ${err.message}`)
     logRequestError(requestId)
     if (!res.headersSent) {

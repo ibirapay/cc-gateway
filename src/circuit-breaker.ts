@@ -38,13 +38,12 @@ export function recordSuccess(): void {
       log('info', 'Circuit breaker: transitioned to closed (upstream recovered)')
     }
   } else if (breaker.state === 'closed') {
-    breaker.successCount++
-    // Reset failure count on success (sliding window)
-    const now = Date.now()
-    if (now - breaker.lastFailureTime > WINDOW_SIZE_MS) {
-      breaker.failureCount = 0
-      breaker.successCount = 0
-    }
+    // A success proves the upstream is reachable: FAILURE_THRESHOLD documents
+    // "consecutive failures", so any success clears the streak. Before 2026-11-26
+    // a success only cleared it when the last failure was older than the window,
+    // so 5 timeouts scattered across a run of successes still opened the breaker.
+    breaker.failureCount = 0
+    breaker.successCount = 0
   }
 }
 
